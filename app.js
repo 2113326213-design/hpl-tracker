@@ -6,13 +6,23 @@
   const CORE_API = "https://api.hypurrscan.io";
   const EVM_API = "https://trace.hypurrscan.io/api/v1";
   const HL_API = "https://api.hyperliquid.xyz/info";
-  const DAILY_REFRESH_MS = 60 * 60 * 1000; // 榜单与流向每小时自动刷新
-  const BOOK_REFRESH_MS = 15 * 1000;       // 盘口与最新成交每 15 秒
-  const MARKET_REFRESH_MS = 5 * 60 * 1000; // 成交额每 5 分钟
+  const FULL_REFRESH_MS = 5 * 60 * 1000;      // 榜单、期间流向、买卖均价：每 5 分钟后台静默刷新
+  const BALANCE_REFRESH_MS = 60 * 1000;       // 前十与项目合约的实时余额：每 60 秒
+  const BOOK_POLL_MS = 5 * 1000;              // 实时推送断开时，盘口改为每 5 秒轮询
+  const TRADES_POLL_MS = 15 * 1000;           // 实时推送断开时，最新成交每 15 秒轮询
+  const AGG_BOOK_REFRESH_MS = 10 * 1000;      // 5% / 10% 合并档位盘口：每 10 秒
+  const MARKET_REFRESH_MS = 10 * 60 * 1000;   // 7 / 30 天成交额与柱状图：每 10 分钟（24 小时数据走实时推送）
+  const LIVE_RENDER_MS = 250;                 // 实时数据最快每 0.25 秒重绘一次
+  const ROWS_PRICE_RENDER_MS = 30 * 1000;     // 价格变化引起的榜单重绘（浮动盈亏等）最多每 30 秒一次
+  const WS_URL = "wss://api.hyperliquid.xyz/ws";
+  const ARCHIVE_RPC = "https://rpc.hyperlend.finance"; // HyperLend 公共节点，支持按历史区块读取余额
+  // 读取当前链上数据的公共节点：一个限流就换下一个
+  const LIVE_RPCS = ["https://rpc.hyperliquid.xyz/evm", "https://rpc.hypurrscan.io", "https://rpc.hyperlend.finance"];
+  const POOL_SIZE = 14;                       // 前十之外多核对 4 个候选，用实时余额重新排名
   const BIG_FLOW_HPL = 1000000;
   const BIG_FLOW_RATIO = 0.1;
   const TAPE_MAX = 60;
-  const RETRY_REFRESH_MS = 15 * 60 * 1000;
+  const RETRY_REFRESH_MS = 2 * 60 * 1000;
   const HISTORY_PAGE_SIZE = 2000;
   const EVM_PAGE_SIZE = 1000;
   const EVM_MAX_PAGES = 20;
@@ -45,6 +55,14 @@
     "0x3aa0a4f916f6c3c9c9054e52cd5aafeb8a09cf39": "空投分发合约",
     "0x5369e34c92eacc1cceaffe1be01f057c68ca1b19": "锁仓合约",
     "0x9450b54a3d9586e117a9b00197cd8a938f9b75e2": "空投领取合约"
+  };
+  // 已核实身份的普通账户（EOA）：只加标签，仍按个人地址参与排名，不归入合约区
+  const ACCOUNT_LABELS = {
+    "0xf2f1d8dfcbfbbcc30fd5671a2dbd37a12e9a8d86": {
+      name: "项目金库出资做市",
+      short: "项目金库拨入 1,000 万 HPL + 5 万 USDC，程序化双边挂单做市",
+      note: "HyperLend 项目金库多签（0xCBF4…3d7b）于 2026-07-23/24 拨入 1,000 万 HPL 与 5 万 USDC；程序化双边挂单做市，约占 Hyperliquid 上 HPL/USDC 七成以上成交"
+    }
   };
   const $ = id => document.getElementById(id);
   const state = {
@@ -83,7 +101,27 @@
     candles: new Map(),
     chart: null,
     chartSeries: null,
-    chartKey: ""
+    chartKey: "",
+    silent: false,
+    bookRaw: null,
+    aggBook: null,
+    aggFetchedAt: 0,
+    aggLoading: false,
+    tradesFetchedAt: 0,
+    balancesLoading: false,
+    statusError: null,
+    statusLoading: null,
+    archiveRetrying: false,
+    historyQuiet: null,
+    historyUserCleared: false,
+    rowsRetryTimer: null,
+    rowsPointerDown: false,
+    marketError: null,
+    live: {
+      ws: null, connected: false, retry: 0, pingTimer: null, reconnectTimer: null, renderTimer: null,
+      lastMsg: 0, lastRender: 0, lastRowsRender: 0, startedAt: 0, lastBadge: null,
+      bookDirty: false, tradesDirty: false, ctxDirty: false, priceChanged: false
+    }
   };
   const nf = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
 
@@ -141,7 +179,7 @@
     return String(value).replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
   }
   function labelFor(wallet) {
-    return LABELS[wallet] || (state.aliases && state.aliases.get(wallet)) || "";
+    return LABELS[wallet] || (ACCOUNT_LABELS[wallet] && ACCOUNT_LABELS[wallet].name) || (state.aliases && state.aliases.get(wallet)) || "";
   }
   function usd(value) {
     if (!Number.isFinite(value)) return "—";
@@ -149,22 +187,80 @@
     if (value >= 1e4) return "$" + fmt(value / 1e4) + " 万";
     return "$" + fmt(value);
   }
-  function setStatus(text) {
-    $("sync-status").textContent = text;
+  // 状态栏优先级：错误 > 进行中 > 已同步。后台静默刷新时不显示“进行中”
+  function renderSyncStatus() {
+    const text = state.statusError || state.statusLoading || syncedText();
+    const el = $("sync-status");
+    if (el.textContent !== text) el.textContent = text;
+  }
+  function setLoading(text) {
+    if (state.silent) return;
+    state.statusLoading = text;
+    renderSyncStatus();
+  }
+  function setError(text) {
+    state.statusError = text;
+    state.statusLoading = null;
+    renderSyncStatus();
+  }
+  function clearStatus() {
+    state.statusError = null;
+    state.statusLoading = null;
+    renderSyncStatus();
+  }
+  function clockText(ms) {
+    return new Date(ms).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  }
+  function syncedText() {
+    const view = state.current;
+    if (!view) return "准备读取数据";
+    const pd = state.periodData;
+    let text = view.balancesAt ? "已同步 · " + clockText(view.balancesAt) : "实时余额读取失败，正在重试";
+    if (view.balancesAt && view.balancesOk === false) text += " · 最近一次余额刷新失败，显示 " + clockText(view.balancesAt) + " 的数据";
+    if (pd && view.rows.some(row => { const detail = pd.details.get(row.address); return !detail || !detail.flowComplete; })) text += " · 部分流向暂不可用";
+    if (pd && pd.fallback) text += " · 部分流向为估算，正在重试";
+    if (!view.verified) text += " · 榜单范围需进一步核对";
+    return text;
+  }
+  // 只在内容真的变化时写入，避免每秒重写打断选中文字
+  function setText(id, text) {
+    const el = $(id);
+    if (el && el.textContent !== text) el.textContent = text;
   }
   function isAbort(error) {
     return error && error.name === "AbortError";
   }
-  async function fetchJson(url, options = {}, retries = 3) {
+  // 每次请求都带超时：调用方取消时立即停止；超时按普通失败处理（可重试、可换节点）
+  function timeoutSignal(signal, ms) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new DOMException("请求超时", "TimeoutError")), ms);
+    const onAbort = () => controller.abort(signal.reason);
+    if (signal) {
+      if (signal.aborted) controller.abort(signal.reason);
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    return {
+      signal: controller.signal,
+      done: () => {
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      }
+    };
+  }
+  async function fetchJson(url, options = {}, retries = 3, timeoutMs = 20000) {
     for (let attempt = 0; attempt <= retries; attempt += 1) {
+      const timed = timeoutSignal(options.signal, timeoutMs);
       try {
-        const response = await fetch(url, options);
+        const response = await fetch(url, { ...options, signal: timed.signal });
         if (!response.ok) throw new Error("HTTP " + response.status);
         return await response.json();
       } catch (error) {
-        if (isAbort(error) || attempt === retries) throw error;
+        // 调用方已取消或整轮已超时：不再重试
+        if (isAbort(error) || attempt === retries || (options.signal && options.signal.aborted)) throw error;
         const limited = /HTTP 429/.test(String(error && error.message));
         await new Promise(resolve => setTimeout(resolve, (limited ? 2500 : 450) * (attempt + 1)));
+      } finally {
+        timed.done();
       }
     }
   }
@@ -285,24 +381,44 @@
       $("book-bid-" + key).innerHTML = depthHtml(range && range.bid);
       $("book-ask-" + key).innerHTML = depthHtml(range && range.ask);
     });
-    $("book-status").textContent = "盘口快照 · 北京时间 " + fullTimeText(book.at) + " · 每 15 秒更新";
+    $("book-status").textContent = liveOk()
+      ? "实时推送 · 北京时间 " + fullTimeText(book.at) + " · 有变化即更新"
+      : "盘口快照 · 北京时间 " + fullTimeText(book.at) + " · 每 5 秒更新（实时推送连接中）";
     const hasIncompleteRange = book.ranges.slice(0, 2).some(range => !range.bid.complete || !range.ask.complete);
     $("book-note").textContent = hasIncompleteRange
       ? "1%/2% 深度仅含官方接口可见的前 20 档；“至少”表示该区间超出可见档位。5%/10% 为合并档位后的约值。挂单可撤销，不等于已成交量。"
       : "官方接口每侧最多显示 20 档；1% 和 2% 区间均在可见范围内，5%/10% 为合并档位后的约值。挂单可撤销，不等于已成交量。";
-    // 盘口偏薄提示
+    // 盘口提示：用“多少钱就能把价格推动 1%”的说法；只在数据完整、方向不矛盾时给结论
     const warns = [];
     const one = book.ranges[0];
-    const thin = (value, name) => { if (value.usdc < 500) warns.push(name + " 1% 内仅 ≈ " + fmt(value.usdc) + " USDC"); };
-    thin(one.bid, "买盘");
-    thin(one.ask, "卖盘");
-    const ratio = one.ask.usdc > 0 ? one.bid.usdc / one.ask.usdc : Infinity;
-    if (ratio >= 5) warns.push("1% 内买盘约为卖盘的 " + (Number.isFinite(ratio) ? fmt(Math.round(ratio)) : "∞") + " 倍，向上更容易被推动");
-    else if (ratio > 0 && ratio <= 0.2) warns.push("1% 内卖盘约为买盘的 " + fmt(Math.round(1 / ratio)) + " 倍，向下更容易被推动");
+    const two = book.ranges[1];
+    const thinBid = one.bid.complete && one.bid.usdc < 500;
+    const thinAsk = one.ask.complete && one.ask.usdc < 500;
+    if (thinBid) {
+      warns.push(one.bid.usdc < 1
+        ? "现价下方 1% 内没有买单，任何市价卖出都会让价格跌 1% 以上"
+        : "现价下方 1% 内的买单只有约 " + fmt(one.bid.usdc) + " USDC，市价卖出超过这个金额，价格就会跌 1% 以上");
+    }
+    if (thinAsk) {
+      warns.push(one.ask.usdc < 1
+        ? "现价上方 1% 内没有卖单，任何市价买入都会让价格涨 1% 以上"
+        : "现价上方 1% 内的卖单只有约 " + fmt(one.ask.usdc) + " USDC，市价买入超过这个金额，价格就会涨 1% 以上");
+    }
+    // 买卖力量对比：2% 区间两侧都完整且都有挂单时才算，并且结论不能和上面的方向相反
+    if (two.bid.complete && two.ask.complete && two.bid.usdc > 0 && two.ask.usdc > 0 && !(thinBid && thinAsk)) {
+      const ratio = two.bid.usdc / two.ask.usdc;
+      const dir = ratio >= 5 ? "up" : ratio <= 0.2 ? "down" : null;
+      const thinDir = thinBid ? "down" : thinAsk ? "up" : null;
+      if (dir && (!thinDir || thinDir === dir)) {
+        warns.push(dir === "up"
+          ? "2% 内买单约是卖单的 " + fmt(Math.round(ratio)) + " 倍，价格更容易被买上去"
+          : "2% 内卖单约是买单的 " + fmt(Math.round(1 / ratio)) + " 倍，价格更容易被卖下来");
+      }
+    }
     const spread = (book.ask.px - book.bid.px) / book.mid;
-    if (spread > 0.01) warns.push("买卖价差 " + (spread * 100).toFixed(2) + "%，偏宽");
+    if (spread > 0.01) warns.push("买一和卖一相差 " + (spread * 100).toFixed(2) + "%，直接市价成交损耗较大");
     $("book-warn").hidden = !warns.length;
-    $("book-warn").textContent = warns.length ? "⚠ 盘口偏薄：" + warns.join("；") + "。" : "";
+    setText("book-warn", warns.length ? (thinBid || thinAsk ? "⚠ 盘口偏薄：" : "盘口提示：") + warns.join("；") + "。" : "");
     renderLadder(book);
   }
 
@@ -344,10 +460,10 @@
     $("tape-caption").textContent = "最近 " + trades.length + " 笔" + (span ? " · 覆盖 " + spanText(span) : "") + " · 合计 ≈ " + fmt(vol) + " USDC";
   }
 
+  // ---------- 盘口与成交：REST 读取（首屏、手动刷新、实时推送断开时使用） ----------
   async function refreshBook(force = false) {
     if (document.hidden && !force) return;
     if (state.bookLoading) return;
-    if (!force && state.book && Date.now() - state.book.fetchedAt < BOOK_REFRESH_MS - 500) return;
     if (!state.pairs?.usdc) {
       $("book-status").textContent = "等待 HPL / USDC 交易对信息";
       return;
@@ -355,16 +471,28 @@
     state.bookLoading = true;
     $("book-reload").disabled = true;
     if (!state.book) $("book-status").textContent = "正在读取盘口…";
+    const now = Date.now();
+    const wantAgg = force || now - state.aggFetchedAt >= AGG_BOOK_REFRESH_MS;
+    const wantTrades = force || now - state.tradesFetchedAt >= TRADES_POLL_MS;
     try {
       const [raw, rawAgg, trades] = await Promise.all([
         info({ type: "l2Book", coin: state.pairs.usdc }),
-        info({ type: "l2Book", coin: state.pairs.usdc, nSigFigs: 3 }).catch(() => null),
-        info({ type: "recentTrades", coin: state.pairs.usdc }).catch(() => null)
+        wantAgg ? info({ type: "l2Book", coin: state.pairs.usdc, nSigFigs: 3 }).catch(() => null) : Promise.resolve(null),
+        wantTrades ? info({ type: "recentTrades", coin: state.pairs.usdc }).catch(() => null) : Promise.resolve(null)
       ]);
-      state.book = parseBook(raw, rawAgg);
+      if (rawAgg) {
+        state.aggBook = rawAgg;
+        state.aggFetchedAt = Date.now();
+      }
+      if (trades) {
+        mergeTrades(trades);
+        state.tradesFetchedAt = Date.now();
+        renderTrades();
+      }
+      // 实时推送正常时，推送来的盘口更快，不用 REST 结果覆盖
+      if (!liveOk() || !state.bookRaw) state.bookRaw = raw;
+      state.book = parseBook(state.bookRaw, state.aggBook);
       renderBook();
-      mergeTrades(trades);
-      renderTrades();
     } catch (_) {
       $("book-status").textContent = state.book
         ? "盘口刷新失败 · 上次快照：北京时间 " + fullTimeText(state.book.at)
@@ -374,8 +502,186 @@
       $("book-reload").disabled = false;
     }
   }
+  async function refreshAggBook() {
+    if (!state.pairs?.usdc || state.aggLoading) return;
+    state.aggLoading = true;
+    try {
+      state.aggBook = await info({ type: "l2Book", coin: state.pairs.usdc, nSigFigs: 3 });
+      state.aggFetchedAt = Date.now();
+      if (state.bookRaw) {
+        state.live.bookDirty = true;
+        queueLiveRender();
+      }
+    } catch (_) { /* 下次再试 */ } finally {
+      state.aggLoading = false;
+    }
+  }
+
+  // ---------- 实时推送（Hyperliquid WebSocket）：盘口、成交、价格与 24 小时数据 ----------
+  function liveOk() {
+    return state.live.connected && Date.now() - state.live.lastMsg < 20000;
+  }
+  // 左上角状态看的是“最近是否真的收到推送”；模式变化时同步刷新盘口与市场状态文字
+  function updateLiveBadge() {
+    const live = state.live;
+    const ok = liveOk();
+    $("live-dot").classList.toggle("off", !ok);
+    setText("live-state", ok
+      ? "实时 · 盘口 / 成交 / 价格秒级推送"
+      : live.ws ? "实时推送连接中 · 暂用轮询"
+      : live.reconnectTimer ? "实时推送重连中 · 暂用轮询"
+      : "连接实时行情…");
+    if (live.lastBadge !== ok) {
+      live.lastBadge = ok;
+      if (state.book) renderBook();
+      renderMarketStats();
+    }
+  }
+  // 正常情况下推送约每秒一条；超过 30 秒没有任何消息就视为断线，丢弃旧连接并重连
+  function liveWatchdog() {
+    const live = state.live;
+    if (live.ws) {
+      const since = live.connected ? live.lastMsg : live.startedAt;
+      if (Date.now() - since > 30000) {
+        const dead = live.ws;
+        live.ws = null;
+        live.connected = false;
+        clearInterval(live.pingTimer);
+        try { dead.close(); } catch (_) { /* 已关闭 */ }
+        scheduleLiveReconnect();
+      }
+    }
+    updateLiveBadge();
+  }
+  function connectLive() {
+    const live = state.live;
+    if (live.ws || live.reconnectTimer || !state.pairs || !state.pairs.usdc || typeof WebSocket !== "function") return;
+    const coin = state.pairs.usdc;
+    let ws;
+    try {
+      ws = new WebSocket(WS_URL);
+    } catch (_) {
+      scheduleLiveReconnect();
+      return;
+    }
+    live.ws = ws;
+    live.startedAt = Date.now();
+    ws.onopen = () => {
+      if (live.ws !== ws) return;
+      live.connected = true;
+      live.lastMsg = Date.now();
+      for (const subscription of [{ type: "l2Book", coin }, { type: "trades", coin }, { type: "activeAssetCtx", coin }]) {
+        ws.send(JSON.stringify({ method: "subscribe", subscription }));
+      }
+      clearInterval(live.pingTimer);
+      live.pingTimer = setInterval(() => {
+        if (ws.readyState === 1) ws.send(JSON.stringify({ method: "ping" }));
+      }, 30000);
+      updateLiveBadge();
+    };
+    ws.onmessage = event => {
+      if (live.ws !== ws) return;
+      live.lastMsg = Date.now();
+      let message;
+      try { message = JSON.parse(event.data); } catch (_) { return; }
+      if (!message) return;
+      const data = message.data;
+      // 真正收到行情数据后才把重连退避清零（防止“连上就断”时每秒重连）
+      if (live.retry && message.channel !== "subscriptionResponse" && message.channel !== "pong") live.retry = 0;
+      if (message.channel === "l2Book" && data && data.coin === coin) {
+        state.bookRaw = data;
+        live.bookDirty = true;
+        queueLiveRender();
+      } else if (message.channel === "trades" && Array.isArray(data)) {
+        mergeTrades(data.filter(trade => trade.coin === coin));
+        live.tradesDirty = true;
+        queueLiveRender();
+      } else if ((message.channel === "activeSpotAssetCtx" || message.channel === "activeAssetCtx") && data && data.coin === coin && data.ctx) {
+        applyLiveCtx(data.ctx);
+        queueLiveRender();
+      }
+    };
+    ws.onclose = () => {
+      if (live.ws !== ws) return;
+      live.ws = null;
+      live.connected = false;
+      clearInterval(live.pingTimer);
+      updateLiveBadge();
+      scheduleLiveReconnect();
+    };
+    ws.onerror = () => {
+      try { ws.close(); } catch (_) { /* 已关闭 */ }
+    };
+  }
+  function scheduleLiveReconnect() {
+    const live = state.live;
+    if (live.reconnectTimer) return;
+    const base = Math.min(30000, 1000 * 2 ** Math.min(live.retry, 5));
+    const delay = Math.round(base * (0.5 + Math.random())); // 随机抖动，避免大家同时重连
+    live.retry += 1;
+    live.reconnectTimer = setTimeout(() => {
+      live.reconnectTimer = null;
+      connectLive();
+    }, delay);
+  }
+  function applyLiveCtx(ctx) {
+    if (!state.market) state.market = { ctx: null, ctxH: null, bars: null, sums: null, at: 0 };
+    state.market.ctx = ctx;
+    state.market.ctxAt = Date.now();
+    const mid = Number(ctx.midPx) || Number(ctx.markPx);
+    if (Number.isFinite(mid) && mid > 0 && mid !== state.price) {
+      state.price = mid;
+      state.live.priceChanged = true;
+    }
+    state.live.ctxDirty = true;
+  }
+  function queueLiveRender() {
+    const live = state.live;
+    if (live.renderTimer) return;
+    const wait = Math.max(0, LIVE_RENDER_MS - (Date.now() - live.lastRender));
+    live.renderTimer = setTimeout(flushLiveRender, wait);
+  }
+  function flushLiveRender() {
+    const live = state.live;
+    if (live.renderTimer) {
+      clearTimeout(live.renderTimer);
+      live.renderTimer = null;
+    }
+    if (document.hidden) return; // 页面在后台时只收数据，回到前台再一次性重绘
+    live.lastRender = Date.now();
+    if (live.bookDirty && state.bookRaw) {
+      live.bookDirty = false;
+      try {
+        state.book = parseBook(state.bookRaw, state.aggBook);
+        renderBook();
+      } catch (_) { /* 盘口暂时不完整，等下一次推送 */ }
+    }
+    if (live.tradesDirty) {
+      live.tradesDirty = false;
+      renderTrades();
+    }
+    if (live.ctxDirty) {
+      live.ctxDirty = false;
+      renderMarketStats();
+      renderPrice();
+    }
+    if (live.priceChanged && state.current && Date.now() - live.lastRowsRender >= ROWS_PRICE_RENDER_MS) {
+      live.priceChanged = false;
+      live.lastRowsRender = Date.now();
+      renderRowsSoon();
+    }
+  }
+  function renderPrice() {
+    const el = $("market-price");
+    const html = state.price ? priceText(state.price) + "<small>USDC</small>" : "—";
+    if (el.dataset.html !== html) {
+      el.dataset.html = html;
+      el.innerHTML = html;
+    }
+  }
 
   // ---------- 成交额与市场概况 ----------
+  const candleNotional = c => c.v * (c.o + c.h + c.l + c.c) / 4;
   async function refreshMarket() {
     if (!state.pairs?.usdc) return;
     const end = Date.now();
@@ -387,50 +693,69 @@
       const list = Array.isArray(ctxs) && Array.isArray(ctxs[1]) ? ctxs[1] : [];
       const ctx = list.find(item => item.coin === state.pairs.usdc) || null;
       const ctxH = state.pairs.usdh ? list.find(item => item.coin === state.pairs.usdh) || null : null;
-      state.market = { ctx, ctxH, candles: Array.isArray(candles) ? candles : [], at: end };
+      const bars = (Array.isArray(candles) ? candles : [])
+        .map(c => ({ t: Number(c.t), o: Number(c.o), h: Number(c.h), l: Number(c.l), c: Number(c.c), v: Number(c.v) }))
+        .filter(c => [c.t, c.o, c.h, c.l, c.c, c.v].every(Number.isFinite));
+      const sumSince = ms => bars.filter(c => c.t >= end - ms).reduce((acc, c) => ({ usd: acc.usd + candleNotional(c), hpl: acc.hpl + c.v }), { usd: 0, hpl: 0 });
+      const prev = state.market;
+      // 实时推送来的 24 小时数据比这里的快照新，保留推送值
+      const liveCtx = prev && prev.ctx && prev.ctxAt && Date.now() - prev.ctxAt < 60000 ? prev.ctx : null;
+      state.market = {
+        ctx: liveCtx || ctx,
+        ctxAt: liveCtx ? prev.ctxAt : end,
+        ctxH,
+        bars,
+        sums: { d1: sumSince(DAY_MS), d7: sumSince(7 * DAY_MS), d30: sumSince(30 * DAY_MS) },
+        at: end
+      };
+      state.marketError = null;
       renderMarket();
     } catch (error) {
-      $("market-status").textContent = state.market ? "成交数据刷新失败，显示上次数据" : "成交数据暂不可用：" + historyErrorText(error);
+      state.marketError = (state.market && state.market.sums ? "7/30 天数据刷新失败，显示上次数据" : "7/30 天数据读取失败") + "（" + historyErrorText(error) + "）";
+      if (state.market) renderMarketStats();
+      else setText("market-status", "成交数据暂不可用：" + historyErrorText(error));
     }
   }
   function renderMarket() {
+    renderMarketStats();
+    if (state.market && state.market.bars) renderVolumeChart(state.market.bars, candleNotional);
+  }
+  function renderMarketStats() {
     const m = state.market;
     if (!m) return;
-    const now = m.at;
-    const bars = m.candles.map(c => ({ t: Number(c.t), o: Number(c.o), h: Number(c.h), l: Number(c.l), c: Number(c.c), v: Number(c.v) }))
-      .filter(c => [c.t, c.o, c.h, c.l, c.c, c.v].every(Number.isFinite));
-    const notional = c => c.v * (c.o + c.h + c.l + c.c) / 4;
-    const sumSince = ms => bars.filter(c => c.t >= now - ms).reduce((acc, c) => ({ usd: acc.usd + notional(c), hpl: acc.hpl + c.v }), { usd: 0, hpl: 0 });
-    const d1 = sumSince(DAY_MS);
-    const d7 = sumSince(7 * DAY_MS);
-    const d30 = sumSince(30 * DAY_MS);
     const ctx = m.ctx;
-    const dayNtl = ctx ? Number(ctx.dayNtlVlm) : d1.usd;
-    const dayBase = ctx ? Number(ctx.dayBaseVlm) : d1.hpl;
-    $("vol-24h").textContent = usd(dayNtl);
-    let sub24 = fmt(dayBase) + " HPL";
+    const sums = m.sums;
+    const dayNtl = ctx ? Number(ctx.dayNtlVlm) : sums ? sums.d1.usd : NaN;
+    const dayBase = ctx ? Number(ctx.dayBaseVlm) : sums ? sums.d1.hpl : NaN;
+    setText("vol-24h", usd(dayNtl));
+    let sub24 = Number.isFinite(dayBase) ? fmt(dayBase) + " HPL" : "—";
     if (m.ctxH && Number(m.ctxH.dayNtlVlm) > 0) sub24 += " · USDH 对另有 " + usd(Number(m.ctxH.dayNtlVlm));
-    $("vol-24h-sub").textContent = sub24;
+    setText("vol-24h-sub", sub24);
     const mid = ctx ? Number(ctx.midPx) || Number(ctx.markPx) : NaN;
     const prev = ctx ? Number(ctx.prevDayPx) : NaN;
     if (Number.isFinite(mid) && Number.isFinite(prev) && prev > 0) {
       const chg = (mid - prev) / prev * 100;
-      $("chg-24h").textContent = (chg > 0 ? "+" : chg < 0 ? "−" : "") + Math.abs(chg).toFixed(2) + "%";
-      $("chg-24h").className = chg > 0 ? "positive" : chg < 0 ? "negative" : "";
-      $("chg-24h-sub").textContent = priceText(prev) + " → " + priceText(mid);
+      setText("chg-24h", (chg > 0 ? "+" : chg < 0 ? "−" : "") + Math.abs(chg).toFixed(2) + "%");
+      const cls = chg > 0 ? "positive" : chg < 0 ? "negative" : "";
+      if ($("chg-24h").className !== cls) $("chg-24h").className = cls;
+      setText("chg-24h-sub", priceText(prev) + " → " + priceText(mid));
     }
-    $("vol-7d").textContent = "≈ " + usd(d7.usd);
-    $("vol-7d-sub").textContent = compact(d7.hpl) + " HPL · 日均 " + usd(d7.usd / 7);
-    $("vol-30d").textContent = "≈ " + usd(d30.usd);
-    $("vol-30d-sub").textContent = compact(d30.hpl) + " HPL · 日均 " + usd(d30.usd / 30);
+    if (sums) {
+      setText("vol-7d", "≈ " + usd(sums.d7.usd));
+      setText("vol-7d-sub", compact(sums.d7.hpl) + " HPL · 日均 " + usd(sums.d7.usd / 7));
+      setText("vol-30d", "≈ " + usd(sums.d30.usd));
+      setText("vol-30d-sub", compact(sums.d30.hpl) + " HPL · 日均 " + usd(sums.d30.usd / 30));
+    }
     const circ = ctx ? Number(ctx.circulatingSupply) : NaN;
     if (Number.isFinite(circ) && Number.isFinite(mid)) {
-      $("mcap").textContent = usd(circ * mid);
-      const turnover = circ > 0 ? dayBase / circ * 100 : 0;
-      $("mcap-sub").textContent = "流通 " + compact(circ) + " HPL · 24h 换手 " + turnover.toFixed(2) + "%";
+      setText("mcap", usd(circ * mid));
+      const turnover = circ > 0 && Number.isFinite(dayBase) ? dayBase / circ * 100 : 0;
+      setText("mcap-sub", "流通 " + compact(circ) + " HPL · 24h 换手 " + turnover.toFixed(2) + "%");
     }
-    $("market-status").textContent = "北京时间 " + fullTimeText(now) + " · 每 5 分钟更新 · 24 小时为官方统计，7/30 天由 K 线估算";
-    renderVolumeChart(bars, notional);
+    setText("market-status", (liveOk()
+      ? "24 小时数据实时推送 · 更新于 " + clockText(m.ctxAt || Date.now())
+      : "24 小时为官方统计 · 更新于 " + clockText(m.ctxAt || m.at || Date.now())) +
+      " · 7/30 天由 K 线估算，每 10 分钟更新" + (state.marketError ? " · " + state.marketError : ""));
   }
   function renderVolumeChart(bars, notional) {
     if (!window.LightweightCharts) return;
@@ -496,17 +821,21 @@
     };
   }
 
-  // 用 HyperEVM 的 eth_getCode 判断地址是否为合约；结果缓存，查询失败视为未知（按个人地址处理）。
+  // 用 HyperEVM 的 eth_getCode 判断地址是否为合约（一次批量请求，节点限流时自动换节点）；
+  // 结果缓存，所有节点都失败时视为未知（按个人地址处理）。
   async function ensureCodes(wallets, signal) {
     const missing = wallets.filter(wallet => !state.codes.has(wallet));
-    await mapLimit(missing, 5, async wallet => {
-      try {
-        const data = await post(EVM_RPC, { jsonrpc: "2.0", id: 1, method: "eth_getCode", params: [wallet, "latest"] }, signal);
-        if (typeof data.result === "string") state.codes.set(wallet, data.result !== "0x" && data.result !== "0x0");
-      } catch (error) {
-        if (isAbort(error)) throw error;
+    if (!missing.length) return;
+    const body = missing.map((wallet, k) => ({ jsonrpc: "2.0", id: k, method: "eth_getCode", params: [wallet, "latest"] }));
+    try {
+      const res = await rpcAny(LIVE_RPCS, body, signal, r => Array.isArray(r) && r.every(item => item && typeof item.result === "string"));
+      for (const item of res) {
+        const wallet = missing[item.id];
+        if (wallet) state.codes.set(wallet, item.result !== "0x" && item.result !== "0x0");
       }
-    });
+    } catch (error) {
+      if (isAbort(error)) throw error;
+    }
   }
   function isContract(wallet) {
     return Boolean(LABELS[wallet]) || state.codes.get(wallet) === true;
@@ -516,7 +845,7 @@
     const exclude = state.excludeContracts;
     const picked = [];
     let scanned = 0;
-    while (scanned < base.all.length && picked.length < 10) {
+    while (scanned < base.all.length && picked.length < POOL_SIZE) {
       const chunk = base.all.slice(scanned, scanned + 12);
       await ensureCodes(chunk.map(row => row.address), signal);
       for (const row of chunk) {
@@ -525,9 +854,11 @@
       scanned += chunk.length;
     }
     if (picked.length < 10) throw new Error("符合条件的持有人不足 10 个");
-    const rows = picked.slice(0, 10).map(row => ({ ...row, contract: isContract(row.address) }));
+    // 多取几个候选（POOL_SIZE），读完实时余额后再定前十，避免索引延迟导致排名错位
+    const pool = picked.slice(0, POOL_SIZE).map(row => ({ ...row, contract: isContract(row.address) }));
+    const rows = pool.slice(0, 10);
     // 榜单校验：第 10 名必须高于榜外任何候选地址可能达到的最大余额
-    const top = new Set(rows.map(row => row.address));
+    const top = new Set(pool.map(row => row.address));
     const cutoff = rows[9].total;
     let outsideUpperBound = base.coreThreshold + base.evmThreshold;
     base.all.forEach((row, index) => {
@@ -541,11 +872,13 @@
       ? base.all.slice(0, scanned).filter(row => isContract(row.address) && row.total >= cutoff).map(row => ({ ...row, contract: true }))
       : [];
     return {
+      pool,
       rows,
       contracts,
       core: base.core,
       evm: base.evm,
       verified: cutoff > outsideUpperBound,
+      outsideUpperBound,
       coreAt: base.coreAt,
       coreHolders: base.coreHolders,
       evmHolders: base.evmHolders
@@ -553,7 +886,8 @@
   }
 
   async function fetchCoreBalance(wallet, signal) {
-    const data = await info({ type: "spotClearinghouseState", user: wallet }, signal);
+    // 余额每分钟都会再读一次，这里只重试 1 次，失败就等下一轮
+    const data = await fetchJson(HL_API, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "spotClearinghouseState", user: wallet }), signal }, 1);
     const balances = Array.isArray(data.balances) ? data.balances : [];
     const match = balances.find(item => item.token === state.pairs?.tokenIndex || item.coin === "HPL");
     return match ? Number(match.total) || 0 : 0;
@@ -565,37 +899,178 @@
     return match ? amount(match.balance, Number(match.decimals || 18)) : 0;
   }
 
-  async function refineCandidates(snapshot, signal) {
-    await mapLimit(snapshot.rows, 4, async row => {
-      const tasks = [];
-      if (!snapshot.core.has(row.address)) {
-        tasks.push(fetchCoreBalance(row.address, signal).then(value => { row.core = value; }).catch(error => { if (!isAbort(error)) row.estimated = true; }));
+  // JSON-RPC：节点限流（HTTP 429，或返回 -32005 / “rate limit”）时立即换节点，并让该节点冷却 60 秒
+  const rpcCooldown = new Map();
+  function rpcRateLimited(res) {
+    const items = Array.isArray(res) ? res : [res];
+    return items.some(item => item && item.error && (item.error.code === -32005 || /rate/i.test(String(item.error.message || ""))));
+  }
+  async function rpcCall(url, body, signal) {
+    const timed = timeoutSignal(signal, 10000);
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: timed.signal });
+      const res = await response.json().catch(() => null);
+      if (response.status === 429 || rpcRateLimited(res)) {
+        rpcCooldown.set(url, Date.now() + 60000);
+        throw new Error("HTTP 429");
       }
-      if (!snapshot.evm.has(row.address)) {
-        tasks.push(fetchEvmBalance(row.address, signal).then(value => { row.evm = value; }).catch(error => { if (!isAbort(error)) row.estimated = true; }));
+      if (!response.ok || !res) throw new Error("HTTP " + response.status);
+      return res;
+    } finally {
+      timed.done();
+    }
+  }
+  // 依次尝试多个节点（冷却中的排在后面），直到拿到满足 accept 的结果
+  async function rpcAny(urls, body, signal, accept = () => true) {
+    const now = Date.now();
+    const cooling = url => (rpcCooldown.get(url) || 0) > now;
+    const ordered = [...urls.filter(url => !cooling(url)), ...urls.filter(cooling)];
+    let lastError = new Error("RPC 请求失败");
+    for (const url of ordered) {
+      try {
+        const res = await rpcCall(url, body, signal);
+        if (accept(res)) return res;
+        lastError = new Error("节点返回不完整");
+      } catch (error) {
+        if (isAbort(error)) throw error;
+        lastError = error;
       }
-      await Promise.all(tasks);
-      row.total = row.core + row.evm;
+    }
+    throw lastError;
+  }
+  // HyperEVM 余额直接读链上 balanceOf（可指定历史区块），不依赖可能延迟的第三方索引
+  async function fetchEvmBalancesAt(wallets, blockTag, urls, signal) {
+    const out = new Map();
+    for (let i = 0; i < wallets.length; i += 20) {
+      const chunk = wallets.slice(i, i + 20);
+      const body = chunk.map((wallet, k) => ({
+        jsonrpc: "2.0", id: k, method: "eth_call",
+        params: [{ to: HPL_CONTRACT, data: "0x70a08231" + wallet.slice(2).toLowerCase().padStart(64, "0") }, blockTag]
+      }));
+      const valid = item => item && typeof item.result === "string" && /^0x[0-9a-fA-F]*$/.test(item.result);
+      const res = await rpcAny(urls, body, signal, r => Array.isArray(r) && r.filter(valid).length === chunk.length);
+      for (const item of res) {
+        const wallet = valid(item) ? chunk[item.id] : null;
+        if (wallet) out.set(wallet, item.result === "0x" ? 0 : Number(BigInt(item.result)) / 1e18);
+      }
+    }
+    return out;
+  }
+  async function fetchCoreBalancesLive(wallets, signal) {
+    const out = new Map();
+    await mapLimit(wallets, 4, async wallet => {
+      try {
+        out.set(wallet, await fetchCoreBalance(wallet, signal));
+      } catch (error) {
+        if (isAbort(error)) throw error;
+      }
     });
-    snapshot.rows.sort((a, b) => b.total - a.total);
+    return out;
+  }
+  // 读取实时余额：只有真正读到的数值才更新，并记下读取时间（coreLiveAt / evmLiveAt）。
+  // rerank=true（每 5 分钟的完整刷新）时在候选池里重新排出前十；否则只更新数值并在前十内重新排序。
+  async function refreshBalances(view, signal, rerank) {
+    const list = [...(rerank ? view.pool : view.rows), ...view.contracts];
+    const wallets = [...new Set(list.map(row => row.address))];
+    const [core, evm] = await Promise.all([
+      fetchCoreBalancesLive(wallets, signal),
+      fetchEvmBalancesAt(wallets, "latest", LIVE_RPCS, signal).catch(error => {
+        if (isAbort(error)) throw error;
+        return new Map();
+      })
+    ]);
+    const now = Date.now();
+    for (const row of list) {
+      row.prevCore = row.core;
+      const liveCore = core.get(row.address);
+      const liveEvm = evm.get(row.address);
+      if (liveCore !== undefined) {
+        row.core = liveCore;
+        row.coreLiveAt = now;
+      }
+      if (liveEvm !== undefined) {
+        row.evm = liveEvm;
+        row.evmLiveAt = now;
+      }
+      row.total = row.core + row.evm;
+    }
+    if (rerank) {
+      view.pool.sort((a, b) => b.total - a.total);
+      view.rows = view.pool.slice(0, 10);
+      // 用实时余额重新做榜单校验
+      if (Number.isFinite(view.outsideUpperBound) && view.rows.length >= 10) view.verified = view.rows[9].total > view.outsideUpperBound;
+    } else {
+      view.rows.sort((a, b) => b.total - a.total);
+    }
+    view.contracts.sort((a, b) => b.total - a.total);
+    const ok = wallets.every(wallet => core.has(wallet) && evm.has(wallet));
+    view.balancesOk = ok;
+    if (ok) view.balancesAt = now;
+    return ok;
+  }
+  // 完整刷新会新建榜单对象：先沿用上一轮读到的实时余额，读取失败时也不会退回到有延迟的索引数据
+  function seedLiveValues(view, prev) {
+    if (!prev) return;
+    const old = new Map();
+    for (const row of [...(prev.pool || prev.rows), ...prev.contracts]) old.set(row.address, row);
+    for (const row of [...view.pool, ...view.contracts]) {
+      const was = old.get(row.address);
+      if (!was) continue;
+      if (was.coreLiveAt) {
+        row.core = was.core;
+        row.coreLiveAt = was.coreLiveAt;
+      }
+      if (was.evmLiveAt) {
+        row.evm = was.evm;
+        row.evmLiveAt = was.evmLiveAt;
+      }
+      row.total = row.core + row.evm;
+    }
+    view.balancesAt = prev.balancesAt;
+  }
+  async function refreshLiveBalances() {
+    const view = state.current;
+    if (!view || state.refreshing || state.balancesLoading || document.hidden) return;
+    state.balancesLoading = true;
+    const timed = timeoutSignal(undefined, 30000);
+    try {
+      const order = view.rows.map(row => row.address).join();
+      await refreshBalances(view, timed.signal, false);
+      if (state.current !== view) return;
+      await extendTrades(view, timed.signal);
+      if (state.current !== view) return;
+      recomputeFlows();
+      renderCurrent();
+      renderRowsSoon();
+      renderSyncStatus();
+      if (view.rows.map(row => row.address).join() !== order) {
+        populateHistoryWallets(true);
+        renderTrades();
+      }
+      void retryArchiveStart();
+      void loadCosts(1);
+    } catch (_) { /* 下一分钟再试 */ } finally {
+      timed.done();
+      state.balancesLoading = false;
+    }
   }
 
-  function staleNote() {
-    if (!state.current) return "";
-    const lag = Date.now() - state.current.coreAt;
-    return lag > 20 * 60 * 1000 ? " · 快照后 " + spanText(lag) + " 内的变动未计入" : "";
+  function updateSnapshotLabel() {
+    const view = state.current;
+    if (!view) return;
+    const pd = state.periodData;
+    const liveAt = view.balancesAt ? "实时余额 " + clockText(view.balancesAt) : "余额读取中";
+    $("snapshot-label").textContent = pd && pd.historyAt
+      ? "比较北京时间 " + timeText(pd.historyAt) + " → 现在（" + liveAt + "）· 跨度 " + spanText(Date.now() - pd.historyAt)
+      : liveAt;
   }
   function renderCurrent() {
     if (!state.current) return;
     const total = state.current.rows.reduce((sum, row) => sum + row.total, 0);
     $("total-holdings").textContent = fmt(total) + " HPL";
     $("holder-count").textContent = "Core " + fmt(state.current.coreHolders) + " 个地址 · EVM " + fmt(state.current.evmHolders) + " 个地址";
-    $("snapshot-label").textContent = "Core 持仓快照：北京时间 " + timeText(state.current.coreAt);
-    if (state.price) {
-      $("market-price").innerHTML = priceText(state.price) + "<small>USDC</small>";
-    } else {
-      $("market-price").textContent = "—";
-    }
+    updateSnapshotLabel();
+    renderPrice();
   }
 
   function renderTradeCell(detail, side) {
@@ -622,22 +1097,30 @@
     $("rows").innerHTML = state.current.rows.map((row, index) => {
       const detail = details && details.get(row.address);
       const name = labelFor(row.address);
-      const label = (name ? '<span class="address-label">' + esc(name) + '</span>' : "") +
+      const acct = ACCOUNT_LABELS[row.address];
+      const label = (acct
+        ? '<span class="address-label account" title="' + esc(acct.note) + '">' + esc(acct.name) + '</span>'
+        : name ? '<span class="address-label">' + esc(name) + '</span>' : "") +
         (row.contract && !LABELS[row.address] ? '<span class="address-label contract">合约</span>' : "");
-      const split = 'Core ' + compact(row.core) + ' · EVM ' + compact(row.evm);
+      const liveAt = Math.min(row.coreLiveAt || 0, row.evmLiveAt || 0);
+      const balanceNote = !row.coreLiveAt || !row.evmLiveAt
+        ? ' · <span class="caution">部分余额来自索引，可能有延迟</span>'
+        : Date.now() - liveAt > 3 * BALANCE_REFRESH_MS ? ' · <span class="caution">余额为 ' + clockText(liveAt) + ' 读取</span>' : '';
+      const split = 'Core ' + compact(row.core) + ' · EVM ' + compact(row.evm) + balanceNote;
       let flow = '<span class="pending">读取中…</span>';
       if (detail && detail.flowComplete) {
         const cls = detail.flow > 0 ? "positive" : detail.flow < 0 ? "negative" : "neutral";
         const bar = Math.abs(detail.flow) > 0 ? '<span class="flow-bar ' + (detail.flow < 0 ? "negative" : "") + '" style="width:' + Math.max(4, Math.round(Math.abs(detail.flow) / maxAbs * 60)) + 'px"></span>' : "";
-        const big = isBigFlow(row, detail.flow) ? '<span class="big-tag">大额</span>' : "";
+        const big = isBigFlow(row, detail.flow) && !detail.indexerFallback ? '<span class="big-tag">大额</span>' : "";
         flow = '<span class="flow ' + cls + '">' + signed(detail.flow) + '</span>' + big + bar + splitHtml(detail);
-      } else if (detail && detail.flowError) {
-        flow = '<span class="muted-cell">读取失败</span>';
+      } else if (detail && (detail.flowError || detail.balanceMissing)) {
+        flow = '<span class="muted-cell">' + (detail.balanceMissing ? "余额读取失败" : "读取失败") + '</span>';
       }
       return '<tr>' +
         '<td><span class="rank">' + String(index + 1).padStart(2, "0") + '</span>' +
         '<a class="addr" href="https://hypurrscan.io/address/' + row.address + '" target="_blank" rel="noopener noreferrer" title="' + row.address + '">' + short(row.address) + ' ↗</a>' +
         label + '<button class="history-link" type="button" data-history-wallet="' + row.address + '">查看历史点位</button>' +
+        (acct ? '<span class="sub acct-note">' + esc(acct.short) + '</span>' : '') +
         '<span class="sub split">' + split + '</span></td>' +
         '<td data-label="当前仓位"><span class="holdings">' + fmt(row.total) + '</span><span class="sub">HPL</span></td>' +
         '<td data-label="期间净流向">' + flow + '</td>' +
@@ -649,6 +1132,27 @@
     renderSummary();
   }
 
+  // 后台更新引起的重绘：用户正在用键盘操作、选中文字或按住鼠标时稍后再画，避免打断
+  function rowsBusy() {
+    const box = document.querySelector(".tablebox");
+    if (!box) return false;
+    const active = document.activeElement;
+    if (active && active !== document.body && box.contains(active) && active.matches(":focus-visible")) return true;
+    const selection = window.getSelection ? window.getSelection() : null;
+    if (selection && !selection.isCollapsed && selection.anchorNode && box.contains(selection.anchorNode)) return true;
+    return Boolean(state.rowsPointerDown);
+  }
+  function renderRowsSoon() {
+    if (state.rowsRetryTimer) return;
+    if (!rowsBusy()) {
+      renderRows();
+      return;
+    }
+    state.rowsRetryTimer = setTimeout(() => {
+      state.rowsRetryTimer = null;
+      renderRowsSoon();
+    }, 1500);
+  }
   function spanText(ms) {
     const hours = ms / 3600000;
     return hours < 48 ? fmt(Math.round(hours * 10) / 10) + " 小时" : fmt(Math.round(hours / 24 * 10) / 10) + " 天";
@@ -664,12 +1168,13 @@
     return net;
   }
   function splitHtml(detail) {
+    const lag = detail && detail.indexerFallback ? '<span class="sub caution">HyperEVM 部分来自索引，可能有延迟</span>' : "";
     const net = tradeNet(detail);
-    if (net === null || !detail.flowComplete) return '<span class="sub">HPL</span>';
+    if (net === null || !detail.flowComplete) return '<span class="sub">HPL</span>' + lag;
     const transfer = detail.flow - net;
     const part = (label, value) => '<span class="' + (Math.abs(value) < 0.5 ? "muted-cell" : value > 0 ? "positive" : "negative") + '">' + label + " " + signed(Math.round(value)) + "</span>";
-    if (Math.abs(net) < 0.5 && Math.abs(transfer) < 0.5) return '<span class="sub">HPL</span>';
-    return '<span class="sub split-line">' + part("交易", net) + " · " + part("转账", transfer) + "</span>";
+    if (Math.abs(net) < 0.5 && Math.abs(transfer) < 0.5) return '<span class="sub">HPL</span>' + lag;
+    return '<span class="sub split-line">' + part("交易", net) + " · " + part("转账", transfer) + "</span>" + lag;
   }
   function isBigFlow(row, flow) {
     const before = Math.max(row.total - flow, 0);
@@ -683,7 +1188,7 @@
       ...state.current.rows.map((row, index) => ({ row, index, detail: details.get(row.address) })),
       ...(state.current.contracts || []).map(row => ({ row, index: -1, detail: details.get(row.address) }))
     ]
-      .filter(item => item.detail && item.detail.flowComplete && isBigFlow(item.row, item.detail.flow))
+      .filter(item => item.detail && item.detail.flowComplete && !item.detail.indexerFallback && isBigFlow(item.row, item.detail.flow))
       .sort((x, y) => Math.abs(y.detail.flow) - Math.abs(x.detail.flow));
     if (!items.length) { box.hidden = true; return; }
     const usdNote = state.price ? flow => " ≈ " + usd(Math.abs(flow) * state.price) : () => "";
@@ -711,12 +1216,12 @@
         known += 1;
         net += detail.flow;
         const cls = detail.flow > 0 ? "positive" : detail.flow < 0 ? "negative" : "neutral";
-        const big = isBigFlow(row, detail.flow) ? '<span class="big-tag">大额</span>' : "";
+        const big = isBigFlow(row, detail.flow) && !detail.indexerFallback ? '<span class="big-tag">大额</span>' : "";
         const before = Math.max(row.total - detail.flow, 0);
         const pct = detail.flow && before > 0 ? '<span class="sub">' + (detail.flow > 0 ? "+" : "−") + (Math.abs(detail.flow) / before * 100).toFixed(1) + "% · 转账/分发/质押</span>" : '<span class="sub">HPL</span>';
         flow = '<span class="flow ' + cls + '">' + signed(detail.flow) + '</span>' + big + pct;
-      } else if (detail && detail.flowError) {
-        flow = '<span class="muted-cell">读取失败</span>';
+      } else if (detail && (detail.flowError || detail.balanceMissing)) {
+        flow = '<span class="muted-cell">' + (detail.balanceMissing ? "余额读取失败" : "读取失败") + '</span>';
       }
       const name = labelFor(row.address) || "未标注合约";
       return '<tr><td data-label=""><a class="addr" href="https://hypurrscan.io/address/' + row.address + '" target="_blank" rel="noopener noreferrer" title="' + row.address + '">' + short(row.address) + ' ↗</a>' +
@@ -732,7 +1237,8 @@
     renderAlerts();
     renderContracts();
     const pd = state.periodData;
-    const actual = pd && pd.historyAt ? pd.coreAt - pd.historyAt : null;
+    updateSnapshotLabel();
+    const actual = pd && pd.historyAt ? Date.now() - pd.historyAt : null;
     const nominal = PERIODS[state.period].ms;
     $("period-caption").textContent = "· " + PERIODS[state.period].label +
       (actual && Math.abs(actual - nominal) > nominal * 0.05 ? "（实际 " + spanText(actual) + "）" : "");
@@ -766,7 +1272,7 @@
       splitCount += 1;
     }
     $("net-split").textContent = splitCount
-      ? "交易 " + signed(Math.round(tradeSum)) + " · 转账 " + signed(Math.round(transferSum)) + " HPL" + (splitCount < flows.length ? "（" + splitCount + " 个地址）" : "")
+      ? "交易 " + signed(Math.round(tradeSum)) + " · 转账 " + signed(Math.round(transferSum)) + " HPL" + (splitCount < flows.length ? "（" + splitCount + " 个地址）" : "") + (state.periodData && state.periodData.fallback ? " · 部分为估算" : "")
       : "持仓快照差额 · HPL";
     const flowCoverage = flows.length;
     const limited = state.current.rows.filter(row => {
@@ -834,9 +1340,8 @@
     return pageFills(wallet, startMs, endMs, false, signal);
   }
 
-  function aggregateFills(data) {
-    const groups = { buy: {}, sell: {} };
-    for (const fill of data.fills) {
+  function addFills(groups, fills) {
+    for (const fill of fills) {
       const label = fill.coin === state.pairs.usdc ? "USDC" : fill.coin === state.pairs.usdh ? "USDH" : null;
       const side = fill.side === "B" ? "buy" : fill.side === "A" ? "sell" : null;
       const qty = Number(fill.sz);
@@ -848,7 +1353,36 @@
       group.count += 1;
       groups[side][label] = group;
     }
+  }
+  function aggregateFills(data) {
+    const groups = { buy: {}, sell: {} };
+    addFills(groups, data.fills);
     return { groups, complete: data.complete };
+  }
+  // 把某个地址的期间成交补到 until（只取上次之后的部分），让“交易 / 转账”拆分和实时流向用同一时间段
+  async function topUpTrades(wallet, detail, until, signal) {
+    const result = await pageFills(wallet, detail.tradesTo + 1, until, false, signal);
+    addFills(detail.trades.groups, result.fills);
+    if (!result.complete) detail.trades.complete = false;
+    detail.tradesTo = until;
+  }
+  // 每分钟：HyperCore 余额有变化（或超过 5 分钟没补）的地址，补上新成交
+  async function extendTrades(view, signal) {
+    const pd = state.periodData;
+    if (!pd || !state.pairs) return;
+    const targets = view.rows.filter(row => {
+      if (row.contract) return false;
+      const detail = pd.details.get(row.address);
+      if (!detail || !detail.trades || detail.trades.error || typeof detail.tradesTo !== "number") return false;
+      return row.core !== row.prevCore || Date.now() - detail.tradesTo > FULL_REFRESH_MS;
+    });
+    await mapLimit(targets, 2, async row => {
+      try {
+        await topUpTrades(row.address, pd.details.get(row.address), Date.now(), signal);
+      } catch (error) {
+        if (isAbort(error)) throw error; // 其他失败保留原样，下一分钟再补
+      }
+    });
   }
 
   const COST_TTL_MS = 30 * 60 * 1000;
@@ -905,23 +1439,42 @@
     try { sessionStorage.setItem(cacheKey, JSON.stringify(result)); } catch (_) { /* 忽略 */ }
     return result;
   }
-  async function loadCosts() {
+  // limit：一次最多算几个（后台每分钟只补 1 个，避免和其他请求挤在一起触发限流）；force：中断正在进行的计算重新开始
+  async function loadCosts(limit = Infinity, force = false) {
     if (!state.current || !state.pairs) return;
-    if (state.costController) state.costController.abort();
+    if (state.costController) {
+      if (!force) return;
+      state.costController.abort();
+    }
     const controller = new AbortController();
     state.costController = controller;
     const view = state.current;
-    const targets = view.rows.filter(row => !row.contract && !state.costs.has(row.address));
-    await mapLimit(targets, 1, async row => {
-      if (controller.signal.aborted) return;
-      try {
-        state.costs.set(row.address, await computeCost(row.address, controller.signal));
-      } catch (error) {
-        if (isAbort(error)) return;
-        state.costs.set(row.address, { error: historyErrorText(error) });
-      }
-      if (state.current === view && !controller.signal.aborted) renderRows();
-    });
+    const now = Date.now();
+    const missing = row => !state.costs.get(row.address);
+    const stale = row => {
+      const cost = state.costs.get(row.address);
+      if (!cost) return true;
+      if (cost.retryAt && now < cost.retryAt) return false;
+      if (cost.error) return true;
+      return Boolean(cost.at) && now - cost.at > COST_TTL_MS;
+    };
+    const targets = view.rows.filter(row => !row.contract && stale(row)).sort((a, b) => missing(b) - missing(a)).slice(0, limit);
+    try {
+      await mapLimit(targets, 1, async row => {
+        if (controller.signal.aborted) return;
+        try {
+          state.costs.set(row.address, await computeCost(row.address, controller.signal));
+        } catch (error) {
+          if (isAbort(error)) return;
+          const prev = state.costs.get(row.address);
+          if (prev && !prev.error) prev.retryAt = Date.now() + 5 * 60 * 1000; // 保留上次的结果，5 分钟后再试
+          else state.costs.set(row.address, { error: historyErrorText(error), at: Date.now(), retryAt: Date.now() + 2 * 60 * 1000 });
+        }
+        if (state.current === view && !controller.signal.aborted) renderRowsSoon();
+      });
+    } finally {
+      if (state.costController === controller) state.costController = null;
+    }
   }
   function renderCostCell(row) {
     if (row.contract) return '<span class="muted-cell">—</span><span class="sub">合约 · 不适用</span>';
@@ -947,7 +1500,15 @@
       '<span class="sub">覆盖 ' + (coverage * 100).toFixed(coverage < 0.1 ? 1 : 0) + '% 持仓 · 已实现 ' + realized + '</span>' + caution;
   }
 
-  function populateHistoryWallets() {
+  function abortHistoryLoads() {
+    if (state.historyController) state.historyController.abort();
+    if (state.historyQuiet) {
+      state.historyQuiet.abort();
+      state.historyQuiet = null;
+    }
+  }
+  // keepCurrent=true（后台刷新）时，已选的地址即使掉出前十也继续保留，不自动切换
+  function populateHistoryWallets(keepCurrent = false) {
     const select = $("history-wallet");
     const fragment = document.createDocumentFragment();
     const placeholder = document.createElement("option");
@@ -960,15 +1521,41 @@
       option.textContent = "#" + (index + 1) + " " + short(row.address) + (labelFor(row.address) ? " · " + labelFor(row.address) : row.contract ? " · 合约" : "");
       fragment.appendChild(option);
     }
+    const inTop = Boolean(state.historyWallet) && state.current.rows.some(row => row.address === state.historyWallet);
+    if (state.historyWallet && !inTop && keepCurrent) {
+      const option = document.createElement("option");
+      option.value = state.historyWallet;
+      option.textContent = short(state.historyWallet) + "（已不在前十）";
+      fragment.appendChild(option);
+    }
     select.replaceChildren(fragment);
-    if (state.historyWallet && state.current.rows.some(row => row.address === state.historyWallet)) {
+    if (state.historyWallet && (inTop || keepCurrent)) {
       select.value = state.historyWallet;
     } else {
-      if (state.historyController) state.historyController.abort();
+      abortHistoryLoads();
       state.historyWallet = null;
       state.historyData = null;
       state.historyLoading = false;
       renderHistory();
+    }
+  }
+  // 后台静默更新当前选中地址的历史成交：成功后才替换，失败保留旧数据
+  async function refreshHistoryQuietly() {
+    const wallet = state.historyWallet;
+    const range = state.historyRange;
+    const data = state.historyData;
+    if (!wallet || state.historyLoading || state.historyQuiet || !data || data.error) return;
+    if (Date.now() - (data.asOf || 0) < FULL_REFRESH_MS - 30 * 1000) return;
+    const controller = new AbortController();
+    state.historyQuiet = controller;
+    try {
+      const fresh = await fetchHistory(wallet, range, controller.signal, () => {});
+      if (controller.signal.aborted || state.historyWallet !== wallet || state.historyRange !== range || state.historyLoading) return;
+      state.historyCache.set(wallet + ":" + range, fresh);
+      state.historyData = fresh;
+      renderHistory();
+    } catch (_) { /* 保留旧数据，下次再试 */ } finally {
+      if (state.historyQuiet === controller) state.historyQuiet = null;
     }
   }
 
@@ -1062,7 +1649,11 @@
 
   function renderHistory() {
     renderHistoryBody();
-    void renderChart(state.historyWallet ? state.historyData : null);
+    const data = state.historyWallet ? state.historyData : null;
+    if (data && !data.error && data.asOf && !state.historyLoading) {
+      $("history-status").textContent += " 数据截至北京时间 " + clockText(data.asOf) + "，每 5 分钟后台更新。";
+    }
+    void renderChart(data);
   }
 
   const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1279,8 +1870,8 @@
   }
 
   async function selectHistoryWallet(wallet, scrollToPanel = false, force = false) {
-    if (state.historyController) state.historyController.abort();
-    const valid = state.current && state.current.rows.some(row => row.address === wallet);
+    abortHistoryLoads();
+    const valid = Boolean(state.current && wallet && (state.current.rows.some(row => row.address === wallet) || wallet === state.historyWallet));
     state.historyWallet = valid ? wallet : null;
     const range = state.historyRange;
     const cacheKey = wallet + ":" + range;
@@ -1295,8 +1886,9 @@
       return;
     }
     if (force) state.historyCache.delete(cacheKey);
-    if (state.historyCache.has(cacheKey)) {
-      state.historyData = state.historyCache.get(cacheKey);
+    const cachedHistory = state.historyCache.get(cacheKey);
+    if (cachedHistory && Date.now() - (cachedHistory.asOf || 0) < FULL_REFRESH_MS) {
+      state.historyData = cachedHistory;
       state.historyLoading = false;
       renderHistory();
       return;
@@ -1354,121 +1946,326 @@
     return before;
   }
 
-  async function loadPeriod() {
-    if (!state.current) return null;
+  // 找到时间点 ms 之前（含）最近的 HyperEVM 区块号（插值查找，通常 4–8 次请求）
+  // 期初时间点只随历史快照变化（约每 6 小时一次），找到的区块记在浏览器里，刷新页面不必重新查找
+  const BLOCK_CACHE_KEY = "hpl-tracker:blocks";
+  const blockCache = (() => {
+    try { return new Map(JSON.parse(localStorage.getItem(BLOCK_CACHE_KEY) || "[]")); } catch (_) { return new Map(); }
+  })();
+  function rememberBlock(key, number) {
+    blockCache.set(key, number);
+    try {
+      localStorage.setItem(BLOCK_CACHE_KEY, JSON.stringify(Array.from(blockCache.entries()).slice(-50)));
+    } catch (_) { /* 存储不可用时忽略 */ }
+  }
+  async function getBlock(tag, signal) {
+    const res = await rpcAny(LIVE_RPCS, { jsonrpc: "2.0", id: 1, method: "eth_getBlockByNumber", params: [tag, false] }, signal, r => r && r.result && r.result.number);
+    return { number: parseInt(res.result.number, 16), ts: parseInt(res.result.timestamp, 16) * 1000 };
+  }
+  async function findBlockAt(ms, signal) {
+    const key = Math.floor(ms / 1000);
+    if (blockCache.has(key)) return blockCache.get(key);
+    let hi = await getBlock("latest", signal);
+    if (ms >= hi.ts) return hi.number;
+    let guessNumber = Math.max(1, hi.number - Math.ceil((hi.ts - ms) / 1000 * 1.1));
+    let lo = await getBlock("0x" + guessNumber.toString(16), signal);
+    for (let i = 0; i < 6 && lo.ts > ms && lo.number > 1; i++) {
+      hi = lo;
+      guessNumber = Math.max(1, lo.number - Math.ceil((lo.ts - ms) / 1000 * 2));
+      lo = await getBlock("0x" + guessNumber.toString(16), signal);
+    }
+    if (lo.ts > ms) throw new Error("找不到对应区块");
+    for (let i = 0; i < 14 && hi.number - lo.number > 1 && ms - lo.ts > 2000; i++) {
+      const rate = (hi.number - lo.number) / Math.max(1, hi.ts - lo.ts);
+      const guess = Math.min(hi.number - 1, Math.max(lo.number + 1, Math.round(lo.number + (ms - lo.ts) * rate)));
+      const block = await getBlock("0x" + guess.toString(16), signal);
+      if (block.ts <= ms) lo = block;
+      else hi = block;
+    }
+    rememberBlock(key, lo.number);
+    return lo.number;
+  }
+  // 期初 HyperEVM 余额（历史区块）不会再变：按“区块:地址”缓存在浏览器里，只读缺的
+  const ARCHIVE_CACHE_KEY = "hpl-tracker:evm-start";
+  const archiveCache = (() => {
+    try { return new Map(JSON.parse(localStorage.getItem(ARCHIVE_CACHE_KEY) || "[]")); } catch (_) { return new Map(); }
+  })();
+  function rememberArchive(block, balances) {
+    for (const [wallet, value] of balances) archiveCache.set(block + ":" + wallet, value);
+    try {
+      localStorage.setItem(ARCHIVE_CACHE_KEY, JSON.stringify(Array.from(archiveCache.entries()).slice(-400)));
+    } catch (_) { /* 存储不可用时忽略 */ }
+  }
+  // patient=true：首次读取时多等两次（历史节点常有短暂限流），仍失败才退回索引；只返回读到的部分
+  async function fetchStartBalances(wallets, block, signal, patient) {
+    const out = new Map();
+    const missing = [];
+    for (const wallet of wallets) {
+      const key = block + ":" + wallet;
+      if (archiveCache.has(key)) out.set(wallet, archiveCache.get(key));
+      else missing.push(wallet);
+    }
+    if (!missing.length) return out;
+    for (const delay of patient ? [0, 3000, 10000] : [0]) {
+      if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+      try {
+        const got = await fetchEvmBalancesAt(missing, "0x" + block.toString(16), [ARCHIVE_RPC], signal);
+        rememberArchive(block, got);
+        for (const [wallet, value] of got) out.set(wallet, value);
+        return out;
+      } catch (error) {
+        if (isAbort(error)) throw error;
+      }
+    }
+    return out;
+  }
+  // 期间净流向 = 当前实时余额 − 期初余额（HyperCore 期初取历史快照，HyperEVM 期初取历史区块余额）。
+  // 某一侧从没读到过实时余额时不计算，避免把有延迟的索引数据当成实时数据。
+  function computeFlow(row, detail) {
+    if (!detail) return;
+    detail.balanceMissing = !row.coreLiveAt || !row.evmLiveAt;
+    if (detail.balanceMissing || detail.flowError) {
+      detail.flowComplete = false;
+      return;
+    }
+    let evmDelta = null;
+    if (typeof detail.startEvm === "number") evmDelta = row.evm - detail.startEvm;
+    else if (typeof detail.evmDelta === "number") evmDelta = detail.evmDelta;
+    if (evmDelta === null) return;
+    detail.flow = (row.core - detail.startCore) + evmDelta;
+    detail.flowComplete = true;
+  }
+  function recomputeFlows() {
+    const pd = state.periodData;
+    const view = state.current;
+    if (!pd || !view) return;
+    for (const row of [...view.rows, ...view.contracts]) computeFlow(row, pd.details.get(row.address));
+  }
+  // 历史节点读取失败时，只重试“期初余额”这一步（指数退避），不重新下载成交和转账记录
+  async function retryArchiveStart() {
+    const pd = state.periodData;
+    if (!pd || !pd.fallback || pd.view !== state.current || state.archiveRetrying || Date.now() < (pd.nextRetryAt || 0)) return;
+    state.archiveRetrying = true;
+    try {
+      if (!pd.block) pd.block = await findBlockAt(pd.historyAt);
+      const missing = Array.from(pd.details.entries()).filter(([, detail]) => detail.startEvm === null).map(([wallet]) => wallet);
+      const got = await fetchStartBalances(missing, pd.block, undefined, false);
+      for (const [wallet, value] of got) {
+        const detail = pd.details.get(wallet);
+        if (!detail) continue;
+        detail.startEvm = value;
+        detail.indexerFallback = false;
+        detail.flowError = false;
+      }
+      pd.fallback = Array.from(pd.details.values()).some(detail => detail.startEvm === null);
+      if (state.periodData === pd) {
+        recomputeFlows();
+        renderRowsSoon();
+        renderSyncStatus();
+      }
+    } catch (_) { /* 退避后再试 */ } finally {
+      if (pd.fallback) {
+        pd.retryDelay = Math.min(FULL_REFRESH_MS, (pd.retryDelay || 30000) * 2);
+        pd.nextRetryAt = Date.now() + pd.retryDelay;
+      }
+      state.archiveRetrying = false;
+    }
+  }
+
+  // options.background：后台更新（不显示过程、算完前保留旧数据）；options.force：忽略缓存
+  async function loadPeriod(options = {}) {
+    const view = state.current;
+    if (!view) return null;
     if (state.periodController) state.periodController.abort();
     const controller = new AbortController();
     state.periodController = controller;
     const generation = ++state.generation;
     const period = state.period;
+    const quiet = Boolean(options.background);
+    const finish = () => { if (state.periodController === controller) state.periodController = null; };
+    const alive = () => !controller.signal.aborted && generation === state.generation && state.current === view;
     const cached = state.periodCache[period];
-    if (cached && cached.coreAt === state.current.coreAt) {
+    if (!options.force && cached && cached.view === view) {
       state.periodData = cached;
+      recomputeFlows();
       renderRows();
-      setStatus("已同步 · " + timeText(Date.now()) + (state.current.verified ? "" : " · 榜单范围需进一步核对"));
+      finish();
+      clearStatus();
       return cached;
     }
-    state.periodData = null;
-    renderRows();
-    setStatus("计算" + PERIODS[period].label + "流向…");
-    const targetMs = state.current.coreAt - PERIODS[period].ms;
+    // 同一时间窗口的上一份结果（当前显示的或缓存的）：期初余额和已有成交可以直接沿用
+    const shown = state.periodData && state.periodData.period === period ? state.periodData : null;
+    const prevPd = shown || cached || null;
+    const keepOld = quiet && Boolean(shown);
+    if (!keepOld) {
+      state.periodData = null;
+      renderRows();
+    }
+    if (!quiet) setLoading("计算" + PERIODS[period].label + "流向…");
+    const nowMs = Date.now();
     let history;
     try {
-      history = await fetchNearestSnapshot(targetMs, state.current.coreAt, controller.signal);
+      history = await fetchNearestSnapshot(nowMs - PERIODS[period].ms, nowMs, controller.signal);
     } catch (error) {
-      if (isAbort(error) || generation !== state.generation) return null;
-      setStatus("历史快照暂不可用");
-      $("coverage-note").textContent = "历史持仓快照读取失败，请刷新重试";
+      if (isAbort(error) || !alive()) return null;
+      finish();
+      if (!quiet) {
+        setError("历史快照暂不可用，请稍后刷新");
+        $("coverage-note").textContent = "历史持仓快照读取失败，请刷新重试";
+      }
       return null;
     }
-    if (generation !== state.generation) return null;
+    if (!alive()) return null;
     const startMs = Number(history.lastUpdate) * 1000;
-    const endMs = state.current.coreAt;
     const past = history.holders;
+    const sameWindow = Boolean(prevPd && prevPd.historyAt === startMs);
+    const tracked = [...view.rows, ...view.contracts];
+    // 期初 HyperEVM 余额：找到期初时间对应的区块，读该区块的历史余额（有缓存）
+    let block = sameWindow && prevPd.block ? prevPd.block : null;
+    let evmStart = new Map();
+    try {
+      if (!block) block = await findBlockAt(startMs, controller.signal);
+      evmStart = await fetchStartBalances(tracked.map(row => row.address), block, controller.signal, true);
+    } catch (error) {
+      if (isAbort(error) || !alive()) return null;
+    }
+    if (!alive()) return null;
     const details = new Map();
-    const tracked = [...state.current.rows, ...(state.current.contracts || [])];
     for (const row of tracked) {
-      const historicalCore = Number(past[row.address] || 0);
+      const old = sameWindow ? prevPd.details.get(row.address) : null;
+      let startEvm = evmStart.has(row.address) ? evmStart.get(row.address) : null;
+      if (startEvm === null && old && typeof old.startEvm === "number") startEvm = old.startEvm;
+      const reuseTrades = !row.contract && old && old.trades && !old.trades.error && typeof old.tradesTo === "number";
       details.set(row.address, {
-        coreDelta: row.core - historicalCore,
+        startCore: Number(past[row.address] || 0),
+        startEvm,
         evmDelta: null,
+        indexerFallback: startEvm === null,
         flow: null,
         flowComplete: false,
         flowError: false,
-        trades: null
+        balanceMissing: false,
+        trades: row.contract ? { groups: { buy: {}, sell: {} }, complete: true } : reuseTrades ? old.trades : null, // 合约不做买卖统计
+        tradesTo: reuseTrades ? old.tradesTo : null
       });
     }
-    state.periodData = { coreAt: state.current.coreAt, historyAt: startMs, details };
-    $("snapshot-label").textContent = "比较北京时间 " + timeText(startMs) + " → " + timeText(state.current.coreAt) + " 的 Core 快照 · 实际跨度 " + spanText(state.current.coreAt - startMs) + staleNote();
-    renderRows();
+    const pd = { period, view, historyAt: startMs, block, details, loadedAt: Date.now(), retryDelay: 30000, nextRetryAt: Date.now() + 60000 };
+    pd.fallback = tracked.some(row => details.get(row.address).startEvm === null);
+    if (!keepOld) {
+      state.periodData = pd;
+      for (const row of tracked) computeFlow(row, details.get(row.address));
+      renderRows();
+    }
     await mapLimit(tracked, 3, async row => {
-      if (controller.signal.aborted || generation !== state.generation) return;
+      if (!alive()) return;
       const detail = details.get(row.address);
-      if (row.contract) detail.trades = { groups: { buy: {}, sell: {} }, complete: true }; // 合约不做买卖统计
-      const tasks = [
-        fetchEvmDelta(row.address, startMs, endMs, controller.signal)
+      const tasks = [];
+      if (detail.startEvm === null) {
+        // 历史节点暂时读不到时，先用 Transfer 事件索引估算（可能有延迟：页面会标注、不触发大额提醒，并在后台重试）
+        tasks.push(fetchEvmDelta(row.address, startMs, Date.now(), controller.signal)
           .then(result => {
-            if (result.complete) {
-              detail.evmDelta = result.delta;
-              detail.flow = detail.coreDelta + detail.evmDelta;
-              detail.flowComplete = true;
-            } else {
-              detail.flowError = true;
-            }
+            if (result.complete) detail.evmDelta = result.delta;
+            else detail.flowError = true;
           })
-          .catch(error => { if (!isAbort(error)) detail.flowError = true; }),
-        row.contract
-          ? Promise.resolve()
-          : state.pairs
-          ? fetchFills(row.address, startMs, endMs, controller.signal)
-            .then(result => { detail.trades = aggregateFills(result); })
-            .catch(error => { if (!isAbort(error)) detail.trades = { error: true }; })
-          : Promise.resolve().then(() => { detail.trades = { error: true }; })
-      ];
+          .catch(error => { if (!isAbort(error)) detail.flowError = true; }));
+      }
+      if (!row.contract) {
+        if (!detail.trades) {
+          const until = Date.now();
+          tasks.push(state.pairs
+            ? fetchFills(row.address, startMs, until, controller.signal)
+              .then(result => {
+                detail.trades = aggregateFills(result);
+                detail.tradesTo = until;
+              })
+              .catch(error => { if (!isAbort(error)) detail.trades = { error: true }; })
+            : Promise.resolve().then(() => { detail.trades = { error: true }; }));
+        } else if (Date.now() - detail.tradesTo > 2 * 60 * 1000) {
+          // 沿用的成交已经过了一会儿：只补上之后的部分
+          tasks.push(topUpTrades(row.address, detail, Date.now(), controller.signal).catch(error => { if (isAbort(error)) throw error; }));
+        }
+      }
       await Promise.all(tasks);
-      if (!controller.signal.aborted && generation === state.generation) renderRows();
-    });
-    if (controller.signal.aborted || generation !== state.generation) return null;
-    const allFlows = state.current.rows.every(row => details.get(row.address).flowComplete);
-    const allTrades = state.current.rows.every(row => details.get(row.address).trades && !details.get(row.address).trades.error);
-    if (allFlows && allTrades) state.periodCache[period] = state.periodData;
-    setStatus((allFlows ? "已同步 · " + timeText(Date.now()) : "部分流向暂不可用") + (state.current.verified ? "" : " · 榜单范围需进一步核对"));
+      computeFlow(row, detail);
+      if (!keepOld && alive()) renderRows();
+    }).catch(error => { if (!isAbort(error)) throw error; });
+    if (!alive()) return null;
+    // 后台更新时，个别地址这次没读到的，沿用上一次（同一时间窗口）的结果，不把好数据换成“读取失败”
+    if (keepOld && sameWindow) {
+      for (const row of tracked) {
+        const detail = details.get(row.address);
+        const old = prevPd.details.get(row.address);
+        if (!old) continue;
+        if (detail.trades && detail.trades.error && old.trades && !old.trades.error) {
+          detail.trades = old.trades;
+          detail.tradesTo = old.tradesTo;
+        }
+        if (detail.flowError && !old.flowError) {
+          detail.flowError = false;
+          detail.evmDelta = old.evmDelta;
+          if (typeof old.startEvm === "number") detail.startEvm = old.startEvm;
+          detail.indexerFallback = detail.startEvm === null;
+        }
+      }
+      pd.fallback = tracked.some(row => details.get(row.address).startEvm === null);
+    }
+    state.periodData = pd;
+    for (const row of tracked) computeFlow(row, details.get(row.address));
+    const allFlows = view.rows.every(row => details.get(row.address).flowComplete);
+    const allTrades = view.rows.every(row => details.get(row.address).trades && !details.get(row.address).trades.error);
+    if (allFlows && allTrades) state.periodCache[period] = pd;
+    finish();
+    clearStatus();
     renderRows();
-    return state.periodData;
+    return pd;
   }
 
-  async function refresh() {
+  async function refresh(manual = false) {
     if (state.currentController) state.currentController.abort();
-    if (state.periodController) state.periodController.abort();
-    state.generation += 1;
     state.lastAttemptAt = Date.now();
     state.refreshing = true;
+    state.silent = Boolean(state.current) && !manual; // 已有数据时的自动刷新在后台静默进行
     const controller = new AbortController();
     state.currentController = controller;
-    $("refresh").disabled = true;
-    setStatus("同步两端持仓…");
+    if (!state.silent) $("refresh").disabled = true;
+    setLoading("同步两端持仓…");
     if (!state.current) $("rows").innerHTML = '<tr><td colspan="6" class="loading">正在读取 HyperCore 与 HyperEVM 持仓…</td></tr>';
+    // 交易对信息只依赖 Hyperliquid：单独读取，实时行情不受第三方持仓接口影响
+    const metaTask = info({ type: "spotMeta" }, controller.signal).then(meta => {
+      const pairs = meta ? derivePairs(meta) : null;
+      if (pairs) state.pairs = pairs;
+      if (!state.pairs || controller.signal.aborted) return;
+      connectLive();
+      if (!state.book || manual) void refreshBook(true);
+      if (!state.market || !state.market.sums || manual) void refreshMarket();
+    }).catch(() => { /* 下次刷新再试 */ });
+    const midsTask = info({ type: "allMids" }, controller.signal).catch(() => null);
     try {
-      const [coreData, evmData, metaResult, midsResult] = await Promise.all([
+      const [coreData, evmData] = await Promise.all([
         fetchJson(CORE_API + "/holdersWithLimit/HPL/100", { signal: controller.signal }),
-        post(EVM_API + "/indexed/token-holders", { token_address: HPL_CONTRACT, limit: 100, offset: 0 }, controller.signal),
-        info({ type: "spotMeta" }, controller.signal).catch(() => null),
-        info({ type: "allMids" }, controller.signal).catch(() => null)
+        post(EVM_API + "/indexed/token-holders", { token_address: HPL_CONTRACT, limit: 100, offset: 0 }, controller.signal)
       ]);
+      await metaTask;
+      const midsResult = await midsTask;
       if (controller.signal.aborted) return;
-      state.pairs = metaResult ? derivePairs(metaResult) : null;
-      void refreshBook(true);
-      void refreshMarket();
-      state.price = state.pairs && midsResult ? Number(midsResult[state.pairs.usdc]) || null : null;
+      if (!liveOk()) {
+        const mid = state.pairs && midsResult ? Number(midsResult[state.pairs.usdc]) : NaN;
+        if (Number.isFinite(mid) && mid > 0) state.price = mid;
+      }
       state.base = buildBase(coreData, evmData);
-      state.costs.clear();
-      state.historyCache.clear();
-      await applyView(controller, true);
+      if (!state.silent) {
+        state.costs.clear();
+        state.historyCache.clear();
+        state.periodCache = {};
+      }
+      await applyView(controller, manual);
       if (!controller.signal.aborted) state.lastRefreshAt = Date.now();
     } catch (error) {
       if (isAbort(error)) return;
-      setStatus(state.current ? "刷新失败，显示上次数据" : "数据读取失败");
-      if (!state.current) {
+      if (state.current) {
+        setError((manual ? "刷新失败" : "后台刷新失败") + "，显示上次数据 · " + clockText(Date.now()));
+      } else {
+        setError("数据读取失败，稍后自动重试");
         $("rows").innerHTML = '<tr><td colspan="6" class="loading">暂时无法读取两端持仓，请稍后刷新。</td></tr>';
         $("history-status").textContent = "榜单读取失败，刷新后再查看历史成交。";
       }
@@ -1476,42 +2273,42 @@
       if (state.currentController === controller) {
         $("refresh").disabled = false;
         state.refreshing = false;
+        state.silent = false;
       }
     }
   }
 
   async function applyView(controller, forceHistory) {
-    setStatus("识别合约地址…");
+    setLoading("识别合约地址…");
     const view = await buildView(state.base, controller.signal);
     if (controller.signal.aborted) return;
+    seedLiveValues(view, state.current);
+    setLoading("读取实时余额…");
+    await refreshBalances(view, controller.signal, true);
+    if (controller.signal.aborted) return;
     state.current = view;
-    state.periodCache = {};
-    state.periodData = null;
+    if (!state.silent) state.periodData = null;
+    recomputeFlows();
     $("contract-scope").textContent = "仅个人地址 · 项目合约见下方";
     renderCurrent();
     renderRows();
-    setStatus("核对跨层余额…");
-    await refineCandidates(state.current, controller.signal);
-    if (state.current.contracts.length) {
-      await refineCandidates({ rows: state.current.contracts, core: state.current.core, evm: state.current.evm }, controller.signal);
+    populateHistoryWallets(state.silent);
+    if (!state.historyWallet && !state.historyUserCleared) {
+      const wallet = (view.rows.find(row => !row.contract) || view.rows[0] || {}).address;
+      if (wallet) void selectHistoryWallet(wallet, false, forceHistory);
+    } else if (state.historyWallet && forceHistory) {
+      void selectHistoryWallet(state.historyWallet, false, true);
+    } else if (state.silent) {
+      void refreshHistoryQuietly();
     }
-    if (controller.signal.aborted) return;
-    renderCurrent();
-    renderRows();
-    populateHistoryWallets();
-    const historyWallet = state.historyWallet ||
-      (state.current.rows.find(row => !row.contract) || state.current.rows[0] || {}).address;
-    if (historyWallet) void selectHistoryWallet(historyWallet, false, forceHistory);
-    await loadPeriod();
-    if (!controller.signal.aborted) void loadCosts();
+    await loadPeriod({ background: state.silent });
+    if (!controller.signal.aborted) void loadCosts(state.silent ? 2 : Infinity, !state.silent);
   }
 
   function refreshIfStale() {
     if (document.hidden || state.refreshing) return;
-    const now = Date.now();
-    if (state.lastRefreshAt && now - state.lastRefreshAt < DAILY_REFRESH_MS) return;
-    if (now - state.lastAttemptAt < RETRY_REFRESH_MS) return;
-    void refresh();
+    const due = Math.max(state.lastRefreshAt + FULL_REFRESH_MS, state.lastAttemptAt + RETRY_REFRESH_MS);
+    if (Date.now() >= due) void refresh(false);
   }
 
   async function selectPeriod(period) {
@@ -1560,9 +2357,15 @@
   });
   $("rows").addEventListener("click", event => {
     const button = event.target.closest("[data-history-wallet]");
-    if (button) void selectHistoryWallet(button.dataset.historyWallet, true);
+    if (button) {
+      state.historyUserCleared = false;
+      void selectHistoryWallet(button.dataset.historyWallet, true);
+    }
   });
-  $("history-wallet").addEventListener("change", event => { void selectHistoryWallet(event.target.value); });
+  $("history-wallet").addEventListener("change", event => {
+    state.historyUserCleared = !event.target.value; // 用户主动清空时，后台刷新不再自动选地址
+    void selectHistoryWallet(event.target.value);
+  });
   if (Object.prototype.hasOwnProperty.call(HISTORY_RANGE_LABELS, $("history-range").value)) {
     state.historyRange = $("history-range").value;
   }
@@ -1600,13 +2403,28 @@
   $("history-reload").addEventListener("click", () => {
     if (state.historyWallet) void selectHistoryWallet(state.historyWallet, false, true);
   });
-  $("refresh").addEventListener("click", () => { void refresh(); });
+  $("refresh").addEventListener("click", () => { void refresh(true); });
   $("book-reload").addEventListener("click", () => { void refreshBook(true); });
-  document.addEventListener("visibilitychange", () => { refreshIfStale(); void refreshBook(); });
-  window.addEventListener("focus", () => { refreshIfStale(); void refreshBook(); });
-  setInterval(refreshIfStale, 10 * 60 * 1000);
+  // 自动刷新全部在后台静默进行：
+  // 盘口 / 成交 / 价格 / 24 小时数据走实时推送；余额每 60 秒；榜单与流向每 5 分钟；7/30 天成交额每 10 分钟
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    flushLiveRender();
+    refreshIfStale();
+    if (state.current && Date.now() - (state.current.balancesAt || 0) >= BALANCE_REFRESH_MS) void refreshLiveBalances();
+    if (!liveOk()) void refreshBook(true);
+  });
+  window.addEventListener("focus", refreshIfStale);
+  setInterval(refreshIfStale, 30 * 1000);
+  setInterval(liveWatchdog, 5 * 1000);
+  $("rows").addEventListener("pointerdown", () => { state.rowsPointerDown = true; });
+  document.addEventListener("pointerup", () => { state.rowsPointerDown = false; });
+  document.addEventListener("pointercancel", () => { state.rowsPointerDown = false; });
+  setInterval(() => { void refreshLiveBalances(); }, BALANCE_REFRESH_MS);
+  setInterval(() => { if (!document.hidden && liveOk()) void refreshAggBook(); }, AGG_BOOK_REFRESH_MS);
+  setInterval(() => { if (!document.hidden && !liveOk()) void refreshBook(); }, BOOK_POLL_MS);
   setInterval(() => { if (!document.hidden) void refreshMarket(); }, MARKET_REFRESH_MS);
-  setInterval(() => { void refreshBook(); }, BOOK_REFRESH_MS);
+  setInterval(() => { if (!document.hidden && state.current) updateSnapshotLabel(); }, 30 * 1000);
   // TradingView 高级图表（官方免费嵌入组件）
   function mountTradingView(symbol) {
     const container = $("tv-container");

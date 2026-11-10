@@ -7,15 +7,15 @@
   <meta name="description" content="追踪 HyperLend HPL 前十地址仓位、成交均价、日周月净流向与实时现货盘口深度。">
   <title>HPL 地址仓位追踪器</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%230b1319'/%3E%3Cpath d='M13 46V18m0 14h38M51 18v28' fill='none' stroke='%2334e4ba' stroke-width='7' stroke-linecap='round'/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="./style.css?v=202611102249">
-  <script src="./vendor/lightweight-charts-4.2.0.js?v=202611102249" defer></script>
-  <script src="./app.js?v=202611102249" defer></script>
+  <link rel="stylesheet" href="./style.css?v=202611110247">
+  <script src="./vendor/lightweight-charts-4.2.0.js?v=202611110247" defer></script>
+  <script src="./app.js?v=202611110247" defer></script>
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <div class="brand"><span class="mark" aria-hidden="true">H</span><span>HPL <span class="brand-slash">/</span> WALLET FLOW</span></div>
-      <div class="topnote"><span class="live-dot" aria-hidden="true"></span>HyperCore + HyperEVM</div>
+      <div class="topnote"><span class="live-dot off" id="live-dot" aria-hidden="true"></span><span id="live-state">连接实时行情…</span></div>
     </header>
 
     <section class="heading" aria-labelledby="page-title">
@@ -89,7 +89,7 @@
       <div class="book-head">
         <div>
           <div class="table-title-line"><h2 id="market-title">成交额与市场概况</h2><span class="chain-tag">CORE</span></div>
-          <p id="market-status" role="status" aria-live="polite">正在读取成交数据…</p>
+          <p id="market-status">正在读取成交数据…</p>
         </div>
       </div>
       <div class="market-stats">
@@ -109,7 +109,7 @@
       <div class="book-head">
         <div>
           <div class="table-title-line"><h2 id="book-title">HPL / USDC 现货盘口</h2><span class="chain-tag">CORE</span></div>
-          <p id="book-status" role="status" aria-live="polite">正在读取盘口…</p>
+          <p id="book-status">正在读取盘口…</p>
         </div>
         <button class="book-reload" id="book-reload" type="button">刷新盘口</button>
       </div>
@@ -232,11 +232,12 @@
       <summary>数据口径与来源 <span aria-hidden="true">＋</span></summary>
       <div class="method-body">
         <p><strong>仓位范围</strong>：榜单合并同一个地址在 HyperCore 的 HPL 现货余额与 HyperEVM 的 HPL ERC-20 余额，排除系统桥接托管地址 <code>0x2000…0078</code>。前 10 名只列个人地址（以 HyperEVM 上是否有合约代码判断，另加已知项目地址），持仓更大的项目合约单独列在“项目合约与托管地址”中；持有 sHPL 等衍生代币的受益人余额未折算进来。</p>
-        <p><strong>资金流向</strong>：对当前前 10 地址，HyperCore 使用当前快照与最接近 24 小时、7 天或 30 天前的历史快照之差（快照约每 6 小时一次，页面会标出实际跨度），HyperEVM 使用同一时段 HPL Transfer 事件的净变动，两端相加。正差额计流入，负差额计流出。转账、跨链、分发、质押和买卖均可能改变余额；这里的流向不等同于交易所买卖量。</p>
+        <p><strong>资金流向</strong>：对当前前 10 地址，HyperCore 使用当前快照与最接近 24 小时、7 天或 30 天前的历史快照之差（快照约每 6 小时一次，页面会标出实际跨度），HyperEVM 使用期初区块余额与当前链上余额之差（读取 HyperLend 公共历史节点；节点不可用时退回 Transfer 事件索引，并在页面上提示），两端相加。当前余额都是实时读取的。正差额计流入，负差额计流出。转账、跨链、分发、质押和买卖均可能改变余额；这里的流向不等同于交易所买卖量。</p>
         <p><strong>买卖均价与历史点位</strong>：读取 Hyperliquid 的 HPL/USDC 与 HPL/USDH 现货成交，按 HPL 成交量加权；历史区优先查询最近成交，选择更久的范围时按时间窗补查，并提示查询上限。没有可查成交不代表地址从未买卖 HPL。官方接口每次最多返回 2,000 笔，且可查旧记录有限，超出时无法由该接口还原。</p>
         <p><strong>成交额</strong>：24 小时成交额取 Hyperliquid 官方 24 小时统计（精确值）；7 天、30 天与每日柱状图由 1 小时 K 线的成交量 × 均价估算，为约值。流通市值 = 官方流通量 × 中间价。最新成交来自官方公开成交流，标注“前十”表示买方或卖方是当前榜单地址。</p>
         <p><strong>交易与转账拆分</strong>：净流向中的“交易”= 期间 HyperCore 现货买入量 − 卖出量（未扣手续费），“转账”= 净流向 − 交易，包含转入转出、跨链、质押、领取空投等。</p>
         <p><strong>持仓成本与浮动盈亏</strong>：对非合约地址，读取近 400 天可查到的 HPL 现货成交，按移动加权平均法计算交易所得仓位的成本（买入手续费以 HPL 扣除、卖出手续费以计价币扣除，USDH 按 1:1 视同 USDC）。卖出超过已买入的部分视为转入筹码，不计入盈亏。“覆盖”表示有成本记录的仓位占当前持仓的比例，其余仓位来自转入，成本未知。官方接口只保留每个地址最近约 1 万笔成交，交易极频繁的地址会标注“仅基于可查到的最近成交”。</p>
+        <p><strong>刷新方式</strong>：盘口、最新成交、价格与 24 小时成交额通过 Hyperliquid 实时推送（WebSocket），有变化即更新；前十与项目合约的余额每 60 秒直接读取 HyperCore 接口与 HyperEVM 链上余额；榜单排名、期间流向与买卖均价每 5 分钟、持仓成本每 30 分钟在后台静默刷新，新数据算好之前继续显示旧数据。页面在后台标签页时暂停刷新，切回来立即补上。</p>
         <p><strong>现货盘口</strong>：5% 与 10% 深度来自按 3 位有效数字合并档位后的盘口，为约值。读取 Hyperliquid HPL/USDC 的买卖挂单，以买一与卖一的均值为中间价，分别累计上下 1% 与 2% 内各档 HPL 数量及按挂单价计算的 USDC 金额。官方接口每侧最多返回 20 档；若 20 档未覆盖完整区间，数字标为“至少”。盘口独立于仓位刷新，随时可能变化或撤单。</p>
         <div class="sources"><a href="https://api.hypurrscan.io/ui/" target="_blank" rel="noopener noreferrer">HyperCore 持有人接口 ↗</a><a href="https://trace.hypurrscan.io/docs/" target="_blank" rel="noopener noreferrer">HyperEVM 持有人与转账接口 ↗</a><a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint" target="_blank" rel="noopener noreferrer">Hyperliquid 成交接口 ↗</a><a href="https://docs.hyperlend.finance/developer-documentation/contract-addresses" target="_blank" rel="noopener noreferrer">HyperLend 合约地址 ↗</a></div>
       </div>

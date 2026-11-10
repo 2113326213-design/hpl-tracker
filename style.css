@@ -11,7 +11,10 @@ a{color:inherit;text-decoration:none}
 .brand-slash{color:#3fe2ba;margin:0 2px}
 .mark{width:33px;height:33px;border-radius:9px;border:2px solid #36e4bb;color:#36e4bb;display:grid;place-items:center;font-size:16px;letter-spacing:-.2em;padding-right:3px}
 .topnote{display:flex;align-items:center;gap:9px;color:#92a8ab;font-size:14px}
-.live-dot{width:7px;height:7px;border-radius:50%;background:#3ee4b7;box-shadow:0 0 0 4px #1c3d37}
+.live-dot{width:7px;height:7px;border-radius:50%;background:#3ee4b7;box-shadow:0 0 0 4px #1c3d37;animation:livepulse 2s ease-in-out infinite}
+.live-dot.off{background:#8fa5a9;box-shadow:0 0 0 4px #253238;animation:none}
+@keyframes livepulse{0%,100%{box-shadow:0 0 0 4px #1c3d37}50%{box-shadow:0 0 0 6px rgba(28,61,55,.25)}}
+@media (prefers-reduced-motion:reduce){.live-dot{animation:none}}
 .heading{display:flex;justify-content:space-between;gap:24px;align-items:end;padding:29px 0 27px}
 .eyebrow{font-size:13px;font-weight:700;letter-spacing:.16em;color:#31ddb4;text-transform:uppercase;margin:0 0 10px}
 .heading h1{font-size:clamp(29px,4vw,47px);letter-spacing:-.055em;line-height:1.12;margin:0;font-weight:760}
@@ -157,6 +160,8 @@ footer{color:#728a8e;font-size:12px;line-height:1.5;margin-top:18px}
 .toggle input:focus-visible + .toggle-track{outline:2px solid #4aeac2;outline-offset:2px}
 .toggle input:disabled + .toggle-track{opacity:.5}
 .address-label.contract{border-color:#4a5566;color:#aab6c8}
+.address-label.account{border-color:#7a5a2a;color:#f3c08f;background:#2a1f16;cursor:help}
+.acct-note{color:#d9b38a;padding-left:30px}
 .history-chart-box{margin:0 23px 16px;border:1px solid #2a4549;border-radius:12px;background:#0f1c22;overflow:hidden}
 .chart-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:11px 14px;border-bottom:1px solid #22343a;font-size:13px;font-weight:650;color:#cfe0dd}
 .chart-legend{color:#8fa6a9;font-weight:500;font-size:12px;display:inline-flex;align-items:center;gap:6px}
