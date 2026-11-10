@@ -65,6 +65,27 @@
       </div>
     </section>
 
+    <section class="tvbox" id="tvbox" aria-labelledby="tv-title">
+      <div class="book-head">
+        <div>
+          <div class="table-title-line"><h2 id="tv-title">K 线图</h2><span class="chain-tag">TRADINGVIEW</span></div>
+          <p>HYPERLIQUID:HPLUSDC · 可切换周期、添加指标、画线；数据由 TradingView 提供</p>
+        </div>
+        <div class="tv-actions">
+          <div class="period-picker tv-pair" role="group" aria-label="选择交易对">
+            <button class="period active" type="button" data-tv-symbol="HYPERLIQUID:HPLUSDC" aria-pressed="true">USDC</button>
+            <button class="period" type="button" data-tv-symbol="HYPERLIQUID:HPLUSDH" aria-pressed="false">USDH</button>
+          </div>
+          <button class="book-reload" id="tv-fullscreen" type="button">⛶ 全屏</button>
+        </div>
+      </div>
+      <div class="tv-frame" id="tv-frame">
+        <div class="tradingview-widget-container" id="tv-container">
+          <div class="tradingview-widget-container__widget"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="marketbox" aria-labelledby="market-title">
       <div class="book-head">
         <div>

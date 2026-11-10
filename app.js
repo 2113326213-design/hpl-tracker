@@ -1590,6 +1590,55 @@
   setInterval(refreshIfStale, 10 * 60 * 1000);
   setInterval(() => { if (!document.hidden) void refreshMarket(); }, MARKET_REFRESH_MS);
   setInterval(() => { void refreshBook(); }, BOOK_REFRESH_MS);
+  // TradingView 高级图表（官方免费嵌入组件）
+  function mountTradingView(symbol) {
+    const container = $("tv-container");
+    container.innerHTML = '<div class="tradingview-widget-container__widget"></div>';
+    const script = document.createElement("script");
+    script.type = "text/javascript";
+    script.async = true;
+    script.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
+    script.text = JSON.stringify({
+      autosize: true,
+      symbol,
+      interval: "60",
+      timezone: "Asia/Shanghai",
+      theme: "dark",
+      style: "1",
+      locale: "zh_CN",
+      backgroundColor: "#0f1c22",
+      gridColor: "rgba(34, 52, 58, 0.6)",
+      withdateranges: true,
+      hide_side_toolbar: false,
+      allow_symbol_change: true,
+      details: true,
+      hotlist: false,
+      calendar: false,
+      studies: ["STD;Volume"],
+      support_host: "https://www.tradingview.com"
+    });
+    container.appendChild(script);
+  }
+  document.querySelectorAll("[data-tv-symbol]").forEach(button => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll("[data-tv-symbol]").forEach(other => {
+        const active = other === button;
+        other.classList.toggle("active", active);
+        other.setAttribute("aria-pressed", String(active));
+      });
+      mountTradingView(button.dataset.tvSymbol);
+    });
+  });
+  $("tv-fullscreen").addEventListener("click", () => {
+    const box = $("tvbox");
+    if (document.fullscreenElement) { void document.exitFullscreen(); return; }
+    if (box.requestFullscreen) box.requestFullscreen().catch(() => {});
+  });
+  document.addEventListener("fullscreenchange", () => {
+    $("tv-fullscreen").textContent = document.fullscreenElement ? "✕ 退出全屏" : "⛶ 全屏";
+  });
+  mountTradingView("HYPERLIQUID:HPLUSDC");
+
   registerWebMcp();
   fetchJson(CORE_API + "/globalAliases").then(data => {
     if (!data || typeof data !== "object") return;
