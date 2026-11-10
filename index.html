@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1319">
+  <meta name="description" content="追踪 HyperLend HPL 前十地址仓位、成交均价、日周月净流向与实时现货盘口深度。">
+  <title>HPL 地址仓位追踪器</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%230b1319'/%3E%3Cpath d='M13 46V18m0 14h38M51 18v28' fill='none' stroke='%2334e4ba' stroke-width='7' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+  <script src="./vendor/lightweight-charts-4.2.0.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="mark" aria-hidden="true">H</span><span>HPL <span class="brand-slash">/</span> WALLET FLOW</span></div>
+      <div class="topnote"><span class="live-dot" aria-hidden="true"></span>HyperCore + HyperEVM</div>
+    </header>
+
+    <section class="heading" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">HyperLend · HPL</p>
+        <h1 id="page-title">地址仓位追踪器</h1>
+        <p class="intro">前 10 大地址仓位、实际成交均价、历史买卖点位、日／周／月净流向与现货盘口</p>
+      </div>
+      <div class="heading-actions">
+        <span class="sync-status" id="sync-status" role="status" aria-live="polite">准备读取数据</span>
+        <button id="refresh" class="refresh" type="button" aria-label="刷新链上数据"><span aria-hidden="true">↻</span> 刷新</button>
+      </div>
+    </section>
+
+    <section class="control-row" aria-label="时间范围">
+      <div class="period-picker" role="group" aria-label="选择统计周期">
+        <button class="period active" type="button" data-period="day" aria-pressed="true">日 <span>24 小时</span></button>
+        <button class="period" type="button" data-period="week" aria-pressed="false">周 <span>7 天</span></button>
+        <button class="period" type="button" data-period="month" aria-pressed="false">月 <span>30 天</span></button>
+      </div>
+      <div class="control-right">
+        <label class="toggle" for="exclude-contracts"><input type="checkbox" id="exclude-contracts"><span class="toggle-track" aria-hidden="true"></span>只看个人地址（排除合约）</label>
+        <div class="snapshot-label" id="snapshot-label">等待持仓快照</div>
+      </div>
+    </section>
+
+    <section class="summary" aria-label="资金流向概览">
+      <div class="card price-card">
+        <div class="card-label">HPL / USDC 参考价</div>
+        <div class="card-value price" id="market-price">—</div>
+        <div class="card-note">Hyperliquid 现货中间价</div>
+      </div>
+      <div class="card net-card">
+        <div class="card-label">前 10 地址净流向 <span id="period-caption">· 24 小时</span></div>
+        <div class="card-value" id="net-flow">—</div>
+        <div class="card-note" id="net-split">持仓快照差额 · HPL</div>
+      </div>
+      <div class="card">
+        <div class="card-label">流入</div>
+        <div class="card-value positive" id="inflow">—</div>
+        <div class="card-note">仓位增加地址合计 · HPL</div>
+      </div>
+      <div class="card">
+        <div class="card-label">流出</div>
+        <div class="card-value negative" id="outflow">—</div>
+        <div class="card-note">仓位减少地址合计 · HPL</div>
+      </div>
+    </section>
+
+    <section class="marketbox" aria-labelledby="market-title">
+      <div class="book-head">
+        <div>
+          <div class="table-title-line"><h2 id="market-title">成交额与市场概况</h2><span class="chain-tag">CORE</span></div>
+          <p id="market-status" role="status" aria-live="polite">正在读取成交数据…</p>
+        </div>
+      </div>
+      <div class="market-stats">
+        <div class="market-stat"><span>24 小时成交额</span><strong id="vol-24h">—</strong><small id="vol-24h-sub">—</small></div>
+        <div class="market-stat"><span>24 小时涨跌</span><strong id="chg-24h">—</strong><small id="chg-24h-sub">—</small></div>
+        <div class="market-stat"><span>7 天成交额</span><strong id="vol-7d">—</strong><small id="vol-7d-sub">—</small></div>
+        <div class="market-stat"><span>30 天成交额</span><strong id="vol-30d">—</strong><small id="vol-30d-sub">—</small></div>
+        <div class="market-stat"><span>流通市值</span><strong id="mcap">—</strong><small id="mcap-sub">—</small></div>
+      </div>
+      <div class="volume-chart-wrap">
+        <div class="chart-head"><span>近 30 天每日成交额 · HPL/USDC</span><span class="chart-legend">北京时间按日汇总 · 约值</span></div>
+        <div class="volume-chart" id="volume-chart"></div>
+      </div>
+    </section>
+
+    <section class="bookbox" aria-labelledby="book-title">
+      <div class="book-head">
+        <div>
+          <div class="table-title-line"><h2 id="book-title">HPL / USDC 现货盘口</h2><span class="chain-tag">CORE</span></div>
+          <p id="book-status" role="status" aria-live="polite">正在读取盘口…</p>
+        </div>
+        <button class="book-reload" id="book-reload" type="button">刷新盘口</button>
+      </div>
+      <div class="book-quotes">
+        <div class="book-quote"><span>买一</span><strong id="book-bid">—</strong><small id="book-bid-size">— HPL 挂单</small></div>
+        <div class="book-quote"><span>卖一</span><strong id="book-ask">—</strong><small id="book-ask-size">— HPL 挂单</small></div>
+        <div class="book-quote"><span>买卖价差</span><strong id="book-spread">—</strong><small>按买卖中间价计算</small></div>
+      </div>
+      <div class="book-depth" role="table" aria-label="中间价附近的可见挂单深度">
+        <div class="book-depth-row book-depth-labels" role="row"><span role="columnheader">距中间价</span><span role="columnheader">买盘 · 中价下方</span><span role="columnheader">卖盘 · 中价上方</span></div>
+        <div class="book-depth-row" role="row"><strong role="rowheader">1% 内</strong><span id="book-bid-1" role="cell">—</span><span id="book-ask-1" role="cell">—</span></div>
+        <div class="book-depth-row" role="row"><strong role="rowheader">2% 内</strong><span id="book-bid-2" role="cell">—</span><span id="book-ask-2" role="cell">—</span></div>
+        <div class="book-depth-row" role="row"><strong role="rowheader">5% 内 <em>约</em></strong><span id="book-bid-5" role="cell">—</span><span id="book-ask-5" role="cell">—</span></div>
+        <div class="book-depth-row" role="row"><strong role="rowheader">10% 内 <em>约</em></strong><span id="book-bid-10" role="cell">—</span><span id="book-ask-10" role="cell">—</span></div>
+      </div>
+      <p class="book-warn" id="book-warn" hidden></p>
+      <div class="book-panels">
+        <div class="ladder">
+          <div class="panel-title">挂单档位 <span>前 20 档 · 柱长为累计数量</span></div>
+          <div class="ladder-grid">
+            <div class="ladder-side">
+              <div class="ladder-row ladder-head"><span>累计 HPL</span><span>数量</span><span>买价</span></div>
+              <div id="ladder-bids"></div>
+            </div>
+            <div class="ladder-side asks">
+              <div class="ladder-row ladder-head"><span>卖价</span><span>数量</span><span>累计 HPL</span></div>
+              <div id="ladder-asks"></div>
+            </div>
+          </div>
+        </div>
+        <div class="tape">
+          <div class="panel-title">最新成交 <span id="tape-caption">读取中…</span></div>
+          <div class="tape-scroller">
+            <table class="tape-table">
+              <thead><tr><th scope="col">时间</th><th scope="col">方向</th><th scope="col">价格</th><th scope="col">数量 HPL</th><th scope="col">金额 USDC</th></tr></thead>
+              <tbody id="tape-rows"><tr><td colspan="5" class="loading">读取中…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <p class="book-note" id="book-note">仅显示官方接口可见的前 20 档挂单；挂单可撤销，不等于已成交量。</p>
+    </section>
+
+    <section class="tablebox" aria-labelledby="holder-title">
+      <div class="tablehead">
+        <div>
+          <div class="table-title-line"><h2 id="holder-title">前 10 大地址</h2><span class="chain-tag">CORE + EVM</span></div>
+          <p>合并同地址在 HyperCore 与 HyperEVM 的直接 HPL 余额 · 排除跨链系统托管地址 · <span id="contract-scope">榜单包含合约</span></p>
+        </div>
+        <div class="table-total"><span>仓位合计</span><strong id="total-holdings">—</strong></div>
+      </div>
+      <div class="flow-alerts" id="flow-alerts" hidden></div>
+      <div class="scroller" role="region" aria-label="前十地址明细，可横向滚动" tabindex="0">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">排名 / 地址</th>
+              <th scope="col">当前仓位</th>
+              <th scope="col">期间净流向</th>
+              <th scope="col">买入均价</th>
+              <th scope="col">卖出均价</th>
+              <th scope="col">持仓成本 / 浮动盈亏</th>
+            </tr>
+          </thead>
+          <tbody id="rows"><tr><td colspan="6" class="loading">正在读取链上数据…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="table-bottom"><span id="coverage-note">买卖均价仅统计该时段的 HyperCore 现货成交</span><span id="holder-count">—</span></div>
+    </section>
+
+    <section class="historybox" id="history" aria-labelledby="history-title">
+      <div class="history-head">
+        <div>
+          <h2 id="history-title">历史买卖点位</h2>
+          <p>选择地址与时间范围，逐笔查看可查到的 HPL 现货买卖时间、成交价与数量。</p>
+        </div>
+        <div class="history-controls">
+          <label for="history-wallet">地址
+            <select id="history-wallet"><option value="">选择前十地址</option></select>
+          </label>
+          <label for="history-range">时间范围
+            <select id="history-range"><option value="recent">最近成交</option><option value="day">近 24 小时</option><option value="week">近 7 天</option><option value="month">近 30 天</option><option value="year">近 365 天</option></select>
+          </label>
+          <label for="history-side">方向
+            <select id="history-side"><option value="all">全部</option><option value="buy">买入</option><option value="sell">卖出</option></select>
+          </label>
+          <button class="history-reload" id="history-reload" type="button" disabled>重新读取</button>
+          <button class="history-reload" id="history-export" type="button" disabled>导出 CSV</button>
+        </div>
+      </div>
+      <p class="history-status" id="history-status" role="status" aria-live="polite">正在准备最近成交记录…</p>
+      <div class="history-summary" id="history-summary" hidden></div>
+      <div class="history-chart-box" id="history-chart-box" hidden>
+        <div class="chart-head"><span id="chart-title">HPL / USDC 价格 · 买卖点位</span><span class="chart-legend"><i class="lg-buy"></i>买入 <i class="lg-sell"></i>卖出 · 北京时间</span></div>
+        <div class="history-chart" id="history-chart"></div>
+        <p class="chart-status" id="chart-status"></p>
+      </div>
+      <div class="history-scroller" id="history-scroller" role="region" aria-label="历史成交点位，可横向滚动" tabindex="0" hidden>
+        <table class="history-table">
+          <thead><tr><th scope="col">成交时间 · 北京</th><th scope="col">方向</th><th scope="col">成交价</th><th scope="col">数量 · HPL</th><th scope="col">成交额</th><th scope="col">交易对</th></tr></thead>
+          <tbody id="history-rows"></tbody>
+        </table>
+      </div>
+      <button class="history-more" id="history-more" type="button" hidden>显示更多</button>
+      <p class="history-note">仅统计 HyperCore 上该地址的 HPL/USDC、HPL/USDH 实际成交；表中成交价不含手续费。“最近成交”优先显示接口返回的最近 2,000 笔全部品种成交中的 HPL 点位。扩大时间范围后可能需要多次查询，页面会先显示已取得的记录。转账、质押和其他场所的交易没有可核实的买卖价；过旧记录可能无法从公开接口找回。</p>
+    </section>
+
+    <details class="method">
+      <summary>数据口径与来源 <span aria-hidden="true">＋</span></summary>
+      <div class="method-body">
+        <p><strong>仓位范围</strong>：榜单合并同一个地址在 HyperCore 的 HPL 现货余额与 HyperEVM 的 HPL ERC-20 余额，排除系统桥接托管地址 <code>0x2000…0078</code>。质押池、资金库等合约地址仍按地址计入；持有 sHPL 等衍生代币的受益人余额未折算进来。</p>
+        <p><strong>资金流向</strong>：对当前前 10 地址，HyperCore 使用当前快照与最接近 24 小时、7 天或 30 天前的历史快照之差（快照约每 6 小时一次，页面会标出实际跨度），HyperEVM 使用同一时段 HPL Transfer 事件的净变动，两端相加。正差额计流入，负差额计流出。转账、跨链、分发、质押和买卖均可能改变余额；这里的流向不等同于交易所买卖量。</p>
+        <p><strong>买卖均价与历史点位</strong>：读取 Hyperliquid 的 HPL/USDC 与 HPL/USDH 现货成交，按 HPL 成交量加权；历史区优先查询最近成交，选择更久的范围时按时间窗补查，并提示查询上限。没有可查成交不代表地址从未买卖 HPL。官方接口每次最多返回 2,000 笔，且可查旧记录有限，超出时无法由该接口还原。</p>
+        <p><strong>成交额</strong>：24 小时成交额取 Hyperliquid 官方 24 小时统计（精确值）；7 天、30 天与每日柱状图由 1 小时 K 线的成交量 × 均价估算，为约值。流通市值 = 官方流通量 × 中间价。最新成交来自官方公开成交流，标注“前十”表示买方或卖方是当前榜单地址。</p>
+        <p><strong>交易与转账拆分</strong>：净流向中的“交易”= 期间 HyperCore 现货买入量 − 卖出量（未扣手续费），“转账”= 净流向 − 交易，包含转入转出、跨链、质押、领取空投等。</p>
+        <p><strong>持仓成本与浮动盈亏</strong>：对非合约地址，读取近 400 天可查到的 HPL 现货成交，按移动加权平均法计算交易所得仓位的成本（买入手续费以 HPL 扣除、卖出手续费以计价币扣除，USDH 按 1:1 视同 USDC）。卖出超过已买入的部分视为转入筹码，不计入盈亏。“覆盖”表示有成本记录的仓位占当前持仓的比例，其余仓位来自转入，成本未知。官方接口只保留每个地址最近约 1 万笔成交，交易极频繁的地址会标注“仅基于可查到的最近成交”。</p>
+        <p><strong>现货盘口</strong>：5% 与 10% 深度来自按 3 位有效数字合并档位后的盘口，为约值。读取 Hyperliquid HPL/USDC 的买卖挂单，以买一与卖一的均值为中间价，分别累计上下 1% 与 2% 内各档 HPL 数量及按挂单价计算的 USDC 金额。官方接口每侧最多返回 20 档；若 20 档未覆盖完整区间，数字标为“至少”。盘口独立于仓位刷新，随时可能变化或撤单。</p>
+        <div class="sources"><a href="https://api.hypurrscan.io/ui/" target="_blank" rel="noopener noreferrer">HyperCore 持有人接口 ↗</a><a href="https://trace.hypurrscan.io/docs/" target="_blank" rel="noopener noreferrer">HyperEVM 持有人与转账接口 ↗</a><a href="https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint" target="_blank" rel="noopener noreferrer">Hyperliquid 成交接口 ↗</a><a href="https://docs.hyperlend.finance/developer-documentation/contract-addresses" target="_blank" rel="noopener noreferrer">HyperLend 合约地址 ↗</a></div>
+      </div>
+    </details>
+    <footer>公开链上数据会有索引延迟。此页用于观察仓位变化，不构成投资建议。</footer>
+  </main>
+</body>
+</html>
