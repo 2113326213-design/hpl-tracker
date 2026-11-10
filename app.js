@@ -18,7 +18,6 @@
   const EVM_MAX_PAGES = 20;
   const EVM_RPC = "https://rpc.hyperliquid.xyz/evm";
   const SNAPSHOT_TOLERANCE_MS = 30 * 60 * 1000;
-  const PREF_KEY = "hpl-tracker:exclude-contracts";
   const HISTORY_MAX_RANGE_REQUESTS = 5;
   const HISTORY_BATCH_SIZE = 50;
   const HISTORY_RANGES = {
@@ -80,7 +79,7 @@
     volumeSeries: null,
     base: null,
     codes: new Map(),
-    excludeContracts: false,
+    excludeContracts: true, // 前十只列个人地址；项目合约另列在下方
     candles: new Map(),
     chart: null,
     chartSeries: null,
@@ -537,8 +536,13 @@
       const possible = row.total + (base.core.has(row.address) ? 0 : base.coreThreshold) + (base.evm.has(row.address) ? 0 : base.evmThreshold);
       outsideUpperBound = Math.max(outsideUpperBound, possible);
     });
+    // 持仓超过第 10 名个人地址的合约，单独列出
+    const contracts = exclude
+      ? base.all.slice(0, scanned).filter(row => isContract(row.address) && row.total >= cutoff).map(row => ({ ...row, contract: true }))
+      : [];
     return {
       rows,
+      contracts,
       core: base.core,
       evm: base.evm,
       verified: cutoff > outsideUpperBound,
@@ -675,7 +679,10 @@
     const box = $("flow-alerts");
     const details = state.periodData && state.periodData.details;
     if (!details || !state.current) { box.hidden = true; return; }
-    const items = state.current.rows.map((row, index) => ({ row, index, detail: details.get(row.address) }))
+    const items = [
+      ...state.current.rows.map((row, index) => ({ row, index, detail: details.get(row.address) })),
+      ...(state.current.contracts || []).map(row => ({ row, index: -1, detail: details.get(row.address) }))
+    ]
       .filter(item => item.detail && item.detail.flowComplete && isBigFlow(item.row, item.detail.flow))
       .sort((x, y) => Math.abs(y.detail.flow) - Math.abs(x.detail.flow));
     if (!items.length) { box.hidden = true; return; }
@@ -684,13 +691,46 @@
       const name = labelFor(item.row.address);
       const before = Math.max(item.row.total - item.detail.flow, 0);
       const pct = before > 0 ? " · " + (item.detail.flow > 0 ? "+" : "−") + (Math.abs(item.detail.flow) / before * 100).toFixed(1) + "%" : "";
-      return '<span class="alert-item">#' + (item.index + 1) + ' ' + short(item.row.address) + (name ? "（" + esc(name) + "）" : "") +
+      return '<span class="alert-item">' + (item.index >= 0 ? "#" + (item.index + 1) : "合约") + ' ' + short(item.row.address) + (name ? "（" + esc(name) + "）" : "") +
         ' <span class="' + (item.detail.flow > 0 ? "positive" : "negative") + '">' + signed(item.detail.flow) + ' HPL</span>' + usdNote(item.detail.flow) + pct + '</span>';
     }).join("");
     box.hidden = false;
   }
+  function renderContracts() {
+    const box = $("contractbox");
+    const list = (state.current && state.current.contracts) || [];
+    if (!list.length) { box.hidden = true; return; }
+    box.hidden = false;
+    const details = state.periodData && state.periodData.details;
+    let total = 0, net = 0, known = 0;
+    $("contract-rows").innerHTML = list.map(row => {
+      total += row.total;
+      const detail = details && details.get(row.address);
+      let flow = '<span class="pending">读取中…</span>';
+      if (detail && detail.flowComplete) {
+        known += 1;
+        net += detail.flow;
+        const cls = detail.flow > 0 ? "positive" : detail.flow < 0 ? "negative" : "neutral";
+        const big = isBigFlow(row, detail.flow) ? '<span class="big-tag">大额</span>' : "";
+        const before = Math.max(row.total - detail.flow, 0);
+        const pct = detail.flow && before > 0 ? '<span class="sub">' + (detail.flow > 0 ? "+" : "−") + (Math.abs(detail.flow) / before * 100).toFixed(1) + "% · 转账/分发/质押</span>" : '<span class="sub">HPL</span>';
+        flow = '<span class="flow ' + cls + '">' + signed(detail.flow) + '</span>' + big + pct;
+      } else if (detail && detail.flowError) {
+        flow = '<span class="muted-cell">读取失败</span>';
+      }
+      const name = labelFor(row.address) || "未标注合约";
+      return '<tr><td data-label=""><a class="addr" href="https://hypurrscan.io/address/' + row.address + '" target="_blank" rel="noopener noreferrer" title="' + row.address + '">' + short(row.address) + ' ↗</a>' +
+        '<span class="address-label' + (LABELS[row.address] ? "" : " contract") + '">' + esc(name) + '</span>' +
+        '<span class="sub">Core ' + compact(row.core) + ' · EVM ' + compact(row.evm) + '</span></td>' +
+        '<td data-label="当前仓位"><span class="holdings">' + fmt(row.total) + '</span><span class="sub">HPL</span></td>' +
+        '<td data-label="期间净流向">' + flow + '</td></tr>';
+    }).join("");
+    $("contract-summary").textContent = list.length + " 个 · 合计 " + compact(total) + " HPL" +
+      (known === list.length ? " · " + PERIODS[state.period].label + "净流向 " + signed(Math.round(net)) : "");
+  }
   function renderSummary() {
     renderAlerts();
+    renderContracts();
     const pd = state.periodData;
     const actual = pd && pd.historyAt ? pd.coreAt - pd.historyAt : null;
     const nominal = PERIODS[state.period].ms;
@@ -1346,7 +1386,8 @@
     const endMs = state.current.coreAt;
     const past = history.holders;
     const details = new Map();
-    for (const row of state.current.rows) {
+    const tracked = [...state.current.rows, ...(state.current.contracts || [])];
+    for (const row of tracked) {
       const historicalCore = Number(past[row.address] || 0);
       details.set(row.address, {
         coreDelta: row.core - historicalCore,
@@ -1360,9 +1401,10 @@
     state.periodData = { coreAt: state.current.coreAt, historyAt: startMs, details };
     $("snapshot-label").textContent = "比较北京时间 " + timeText(startMs) + " → " + timeText(state.current.coreAt) + " 的 Core 快照 · 实际跨度 " + spanText(state.current.coreAt - startMs) + staleNote();
     renderRows();
-    await mapLimit(state.current.rows, 3, async row => {
+    await mapLimit(tracked, 3, async row => {
       if (controller.signal.aborted || generation !== state.generation) return;
       const detail = details.get(row.address);
+      if (row.contract) detail.trades = { groups: { buy: {}, sell: {} }, complete: true }; // 合约不做买卖统计
       const tasks = [
         fetchEvmDelta(row.address, startMs, endMs, controller.signal)
           .then(result => {
@@ -1375,7 +1417,9 @@
             }
           })
           .catch(error => { if (!isAbort(error)) detail.flowError = true; }),
-        state.pairs
+        row.contract
+          ? Promise.resolve()
+          : state.pairs
           ? fetchFills(row.address, startMs, endMs, controller.signal)
             .then(result => { detail.trades = aggregateFills(result); })
             .catch(error => { if (!isAbort(error)) detail.trades = { error: true }; })
@@ -1402,7 +1446,6 @@
     const controller = new AbortController();
     state.currentController = controller;
     $("refresh").disabled = true;
-    $("exclude-contracts").disabled = true;
     setStatus("同步两端持仓…");
     if (!state.current) $("rows").innerHTML = '<tr><td colspan="6" class="loading">正在读取 HyperCore 与 HyperEVM 持仓…</td></tr>';
     try {
@@ -1432,7 +1475,6 @@
     } finally {
       if (state.currentController === controller) {
         $("refresh").disabled = false;
-        $("exclude-contracts").disabled = false;
         state.refreshing = false;
       }
     }
@@ -1445,11 +1487,14 @@
     state.current = view;
     state.periodCache = {};
     state.periodData = null;
-    $("contract-scope").textContent = state.excludeContracts ? "已排除合约与项目地址" : "榜单包含合约";
+    $("contract-scope").textContent = "仅个人地址 · 项目合约见下方";
     renderCurrent();
     renderRows();
     setStatus("核对跨层余额…");
     await refineCandidates(state.current, controller.signal);
+    if (state.current.contracts.length) {
+      await refineCandidates({ rows: state.current.contracts, core: state.current.core, evm: state.current.evm }, controller.signal);
+    }
     if (controller.signal.aborted) return;
     renderCurrent();
     renderRows();
@@ -1459,31 +1504,6 @@
     if (historyWallet) void selectHistoryWallet(historyWallet, false, forceHistory);
     await loadPeriod();
     if (!controller.signal.aborted) void loadCosts();
-  }
-
-  async function toggleContracts(checked) {
-    state.excludeContracts = checked;
-    try { localStorage.setItem(PREF_KEY, checked ? "1" : "0"); } catch (_) { /* 存储不可用时忽略 */ }
-    if (!state.base || state.refreshing) return;
-    if (state.periodController) state.periodController.abort();
-    state.generation += 1;
-    const controller = new AbortController();
-    state.currentController = controller;
-    state.refreshing = true;
-    $("refresh").disabled = true;
-    $("exclude-contracts").disabled = true;
-    try {
-      await applyView(controller, false);
-      if (!controller.signal.aborted) state.lastRefreshAt = Date.now();
-    } catch (error) {
-      if (!isAbort(error)) setStatus("切换失败：" + (error.message || "数据暂不可用"));
-    } finally {
-      if (state.currentController === controller) {
-        state.refreshing = false;
-        $("refresh").disabled = false;
-        $("exclude-contracts").disabled = false;
-      }
-    }
   }
 
   function refreshIfStale() {
@@ -1581,9 +1601,6 @@
     if (state.historyWallet) void selectHistoryWallet(state.historyWallet, false, true);
   });
   $("refresh").addEventListener("click", () => { void refresh(); });
-  try { state.excludeContracts = localStorage.getItem(PREF_KEY) === "1"; } catch (_) { /* 存储不可用时使用默认值 */ }
-  $("exclude-contracts").checked = state.excludeContracts;
-  $("exclude-contracts").addEventListener("change", event => { void toggleContracts(event.target.checked); });
   $("book-reload").addEventListener("click", () => { void refreshBook(true); });
   document.addEventListener("visibilitychange", () => { refreshIfStale(); void refreshBook(); });
   window.addEventListener("focus", () => { refreshIfStale(); void refreshBook(); });

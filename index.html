@@ -37,7 +37,6 @@
         <button class="period" type="button" data-period="month" aria-pressed="false">月 <span>30 天</span></button>
       </div>
       <div class="control-right">
-        <label class="toggle" for="exclude-contracts"><input type="checkbox" id="exclude-contracts"><span class="toggle-track" aria-hidden="true"></span>只看个人地址（排除合约）</label>
         <div class="snapshot-label" id="snapshot-label">等待持仓快照</div>
       </div>
     </section>
@@ -157,7 +156,7 @@
     <section class="tablebox" aria-labelledby="holder-title">
       <div class="tablehead">
         <div>
-          <div class="table-title-line"><h2 id="holder-title">前 10 大地址</h2><span class="chain-tag">CORE + EVM</span></div>
+          <div class="table-title-line"><h2 id="holder-title">前 10 大个人地址</h2><span class="chain-tag">CORE + EVM</span></div>
           <p>合并同地址在 HyperCore 与 HyperEVM 的直接 HPL 余额 · 排除跨链系统托管地址 · <span id="contract-scope">榜单包含合约</span></p>
         </div>
         <div class="table-total"><span>仓位合计</span><strong id="total-holdings">—</strong></div>
@@ -180,6 +179,17 @@
       </div>
       <div class="table-bottom"><span id="coverage-note">买卖均价仅统计该时段的 HyperCore 现货成交</span><span id="holder-count">—</span></div>
     </section>
+
+    <details class="contractbox" id="contractbox" hidden>
+      <summary><span class="contract-title">项目合约与托管地址 <span class="chain-tag">CORE + EVM</span></span><span class="contract-summary" id="contract-summary"></span><span class="contract-plus" aria-hidden="true">＋</span></summary>
+      <p class="contract-note">持仓超过第 10 名个人地址的合约：资金库、锁仓、质押、空投等。它们不在市场上买卖，变动来自解锁、分发、质押与转账，不计算成本与盈亏。</p>
+      <div class="scroller" role="region" aria-label="项目合约明细" tabindex="0">
+        <table class="contract-table">
+          <thead><tr><th scope="col">地址 / 名称</th><th scope="col">当前仓位</th><th scope="col">期间净流向</th></tr></thead>
+          <tbody id="contract-rows"></tbody>
+        </table>
+      </div>
+    </details>
 
     <section class="historybox" id="history" aria-labelledby="history-title">
       <div class="history-head">
@@ -221,7 +231,7 @@
     <details class="method">
       <summary>数据口径与来源 <span aria-hidden="true">＋</span></summary>
       <div class="method-body">
-        <p><strong>仓位范围</strong>：榜单合并同一个地址在 HyperCore 的 HPL 现货余额与 HyperEVM 的 HPL ERC-20 余额，排除系统桥接托管地址 <code>0x2000…0078</code>。质押池、资金库等合约地址仍按地址计入；持有 sHPL 等衍生代币的受益人余额未折算进来。</p>
+        <p><strong>仓位范围</strong>：榜单合并同一个地址在 HyperCore 的 HPL 现货余额与 HyperEVM 的 HPL ERC-20 余额，排除系统桥接托管地址 <code>0x2000…0078</code>。前 10 名只列个人地址（以 HyperEVM 上是否有合约代码判断，另加已知项目地址），持仓更大的项目合约单独列在“项目合约与托管地址”中；持有 sHPL 等衍生代币的受益人余额未折算进来。</p>
         <p><strong>资金流向</strong>：对当前前 10 地址，HyperCore 使用当前快照与最接近 24 小时、7 天或 30 天前的历史快照之差（快照约每 6 小时一次，页面会标出实际跨度），HyperEVM 使用同一时段 HPL Transfer 事件的净变动，两端相加。正差额计流入，负差额计流出。转账、跨链、分发、质押和买卖均可能改变余额；这里的流向不等同于交易所买卖量。</p>
         <p><strong>买卖均价与历史点位</strong>：读取 Hyperliquid 的 HPL/USDC 与 HPL/USDH 现货成交，按 HPL 成交量加权；历史区优先查询最近成交，选择更久的范围时按时间窗补查，并提示查询上限。没有可查成交不代表地址从未买卖 HPL。官方接口每次最多返回 2,000 笔，且可查旧记录有限，超出时无法由该接口还原。</p>
         <p><strong>成交额</strong>：24 小时成交额取 Hyperliquid 官方 24 小时统计（精确值）；7 天、30 天与每日柱状图由 1 小时 K 线的成交量 × 均价估算，为约值。流通市值 = 官方流通量 × 中间价。最新成交来自官方公开成交流，标注“前十”表示买方或卖方是当前榜单地址。</p>

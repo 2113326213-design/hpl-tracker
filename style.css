@@ -165,6 +165,15 @@ footer{color:#728a8e;font-size:12px;line-height:1.5;margin-top:18px}
 .history-chart{height:340px;width:100%}
 .chart-status{margin:0;padding:8px 14px 10px;color:#82999c;font-size:12px;line-height:1.5}
 .chart-status:empty{display:none}
+.contractbox{margin-top:18px;background:#101b21;border:1px solid #21353b;border-radius:17px;overflow:hidden}
+.contractbox summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:14px;padding:17px 23px;flex-wrap:wrap}
+.contractbox summary::-webkit-details-marker{display:none}
+.contract-title{display:flex;align-items:center;gap:11px;font-size:17px;font-weight:700;letter-spacing:-.02em}
+.contract-summary{color:#9cb1b0;font-size:13px;font-variant-numeric:tabular-nums;flex:1}
+.contract-plus{color:#5adfba;font-size:20px;line-height:1;transition:transform .18s}
+.contractbox[open] .contract-plus{transform:rotate(45deg)}
+.contract-note{margin:0;padding:12px 23px;border-top:1px solid #22343a;color:#8fa5a9;font-size:12px;line-height:1.5}
+.contract-table{min-width:640px}
 .tvbox{background:#101b21;border:1px solid #21353b;border-radius:17px;margin-bottom:18px;overflow:hidden}
 .tv-actions{display:flex;align-items:center;gap:10px}
 .tv-pair .period{padding:7px 12px;font-size:13px}
@@ -232,3 +241,5 @@ footer{color:#728a8e;font-size:12px;line-height:1.5;margin-top:18px}
 }
 
 @media(max-width:700px){.tv-actions{width:100%;justify-content:space-between}.tvbox .book-head{flex-direction:column;align-items:flex-start}.tv-frame{height:70vh;min-height:420px}}
+
+@media(max-width:700px){.contractbox table{min-width:0}.contractbox thead{display:none}.contractbox tbody tr{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;padding:14px 16px;border-bottom:1px solid #1d2e34}.contractbox tbody td,.contractbox tbody td:first-child,.contractbox tbody td:last-child{padding:0;border:0;text-align:left}.contractbox tbody td:first-child{grid-column:1/-1}.contractbox tbody td[data-label]:not([data-label=""])::before{content:attr(data-label);display:block;font-size:11px;color:#7c9699;margin-bottom:4px;font-weight:650}.contractbox summary{padding:15px 16px}}
